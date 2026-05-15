@@ -1,1 +1,4 @@
 # go-az-secrets-rotator
+This is going to be a Go app that has a control plane and workers to rotate secrets in Azure. The goal is to be able to set up different scoped workers and onboard the onto the control plane, the workers can live in different VNETS and have their creds scoped individually to what they need to rotate. This allows us to centrally track and log rotations through the control plane but not have the overly permissive SP that needs access to every environment.
+
+Users/teams should be able to onboard a worker and register it with the control plane and then start onboarding all their secrets that need rotating.
