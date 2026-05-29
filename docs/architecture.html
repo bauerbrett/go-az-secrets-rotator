@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AZ Secrets Rotator — Architecture</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface2: #21262d;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --accent: #58a6ff;
+  --accent2: #3fb950;
+  --accent3: #d2a8ff;
+  --accent4: #f78166;
+  --accent5: #79c0ff;
+  --cyan: #56d4dd;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+/* Navigation */
+nav { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 2rem; display: flex; align-items: center; gap: 2rem; position: sticky; top: 0; z-index: 100; }
+nav h1 { font-size: 1rem; color: var(--accent); padding: 1rem 0; white-space: nowrap; }
+nav .tabs { display: flex; gap: 0; }
+nav .tab { padding: 1rem 1.5rem; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; font-size: 0.9rem; user-select: none; }
+nav .tab:hover { color: var(--text); background: var(--surface2); }
+nav .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* Pages */
+.page { display: none; padding: 2rem; max-width: 1400px; margin: 0 auto; }
+.page.active { display: block; }
+
+/* Diagram */
+.diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 2rem; overflow-x: auto; }
+.diagram-container svg { width: 100%; min-width: 1000px; height: auto; }
+.diagram-container svg text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.svg-node { cursor: pointer; transition: opacity 0.2s; }
+.svg-node:hover { opacity: 0.8; }
+
+/* Flows */
+.flow-section { margin-bottom: 2.5rem; }
+.flow-title { font-size: 1.05rem; color: var(--accent3); margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+.flow-title .flow-num { background: var(--accent3); color: var(--bg); width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 700; flex-shrink: 0; }
+.flow-steps { position: relative; padding-left: 2rem; }
+.flow-step { position: relative; padding: 0.75rem 1rem; margin-bottom: 0.75rem; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; font-size: 0.85rem; line-height: 1.5; }
+.flow-step::before { content: ''; position: absolute; left: -1.5rem; top: 50%; width: 12px; height: 12px; background: var(--accent2); border-radius: 50%; transform: translate(-50%, -50%); }
+.flow-step::after { content: ''; position: absolute; left: calc(-1.5rem - 1px); top: calc(50% + 6px); width: 2px; height: calc(100% + 0.75rem - 6px); background: var(--border); }
+.flow-step:last-child::after { display: none; }
+.flow-step strong { color: var(--accent5); }
+.flow-step code { background: var(--surface2); padding: 1px 5px; border-radius: 3px; font-size: 0.8rem; }
+.flow-category { font-size: 1.3rem; color: var(--text); margin-bottom: 1.5rem; margin-top: 2.5rem; padding-bottom: 0.5rem; border-bottom: 2px solid var(--border); }
+.flow-category:first-child { margin-top: 0; }
+
+/* Security */
+.sec-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 1.5rem; }
+.sec-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; }
+.sec-card h3 { color: var(--accent2); margin-bottom: 0.75rem; font-size: 0.95rem; }
+.sec-card ul { list-style: none; padding: 0; }
+.sec-card li { font-size: 0.85rem; color: var(--text-muted); padding: 0.35rem 0; padding-left: 1.2rem; position: relative; line-height: 1.4; }
+.sec-card li::before { content: '→'; position: absolute; left: 0; color: var(--accent2); }
+.sec-header { font-size: 1.2rem; color: var(--text); margin-bottom: 1.5rem; }
+
+/* Detail Panel */
+.detail-panel { position: fixed; top: 0; right: -500px; width: 500px; height: 100vh; background: var(--surface); border-left: 1px solid var(--border); overflow-y: auto; transition: right 0.3s ease; z-index: 200; box-shadow: -4px 0 20px rgba(0,0,0,0.4); }
+.detail-panel.open { right: 0; }
+.detail-panel-header { padding: 1.5rem 2rem; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); display: flex; align-items: center; justify-content: space-between; z-index: 10; min-height: 60px; }
+.detail-panel-header h2 { font-size: 1.1rem; color: var(--accent); margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.detail-panel-header .close { background: none; border: 1px solid var(--border); color: var(--text-muted); font-size: 1.2rem; cursor: pointer; width: 32px; height: 32px; border-radius: 6px; display: flex; align-items: center; justify-content: center; transition: all 0.15s; }
+.detail-panel-header .close:hover { background: var(--surface2); color: var(--text); }
+.detail-panel-body { padding: 1.5rem 2rem; }
+.detail-panel-body .desc { font-size: 0.9rem; color: var(--text-muted); line-height: 1.6; margin-bottom: 1.5rem; }
+.detail-section { margin-bottom: 1.5rem; }
+.detail-section h4 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.6rem; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border); }
+.detail-section ul { list-style: none; }
+.detail-section li { font-size: 0.85rem; padding: 0.4rem 0 0.4rem 1rem; color: var(--text); position: relative; line-height: 1.4; }
+.detail-section li::before { content: '•'; position: absolute; left: 0; color: var(--accent); }
+.detail-badges { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem; }
+.detail-badge { font-size: 0.7rem; padding: 3px 10px; border-radius: 12px; }
+.dbadge-blue { background: rgba(88,166,255,0.15); color: var(--accent); }
+.dbadge-green { background: rgba(63,185,80,0.15); color: var(--accent2); }
+.dbadge-purple { background: rgba(210,168,255,0.15); color: var(--accent3); }
+.dbadge-orange { background: rgba(247,129,102,0.15); color: var(--accent4); }
+.dbadge-cyan { background: rgba(86,212,221,0.15); color: var(--cyan); }
+
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 199; display: none; }
+.overlay.open { display: block; }
+
+.hint { color: var(--text-muted); font-size: 0.8rem; margin-top: 1rem; }
+
+@media (max-width: 900px) {
+  nav { flex-direction: column; align-items: flex-start; gap: 0; padding: 0 1rem; }
+  .page { padding: 1rem; }
+  .detail-panel { width: 100%; right: -100%; }
+  .sec-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <h1>AZ Secrets Rotator</h1>
+  <div class="tabs">
+    <div class="tab active" data-page="diagram">Diagram</div>
+    <div class="tab" data-page="flows">Flows</div>
+    <div class="tab" data-page="security">Security</div>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════════════════════════ DIAGRAM ═══════════════════════════════════════════════ -->
+<div class="page active" id="page-diagram">
+  <div class="diagram-container">
+    <svg viewBox="0 0 1200 780" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+          <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#21262d" stroke-width="0.5"/>
+        </pattern>
+        <marker id="arr" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#58a6ff"/>
+        </marker>
+        <marker id="arr-g" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#3fb950"/>
+        </marker>
+        <marker id="arr-p" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#d2a8ff"/>
+        </marker>
+        <marker id="arr-o" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#f78166"/>
+        </marker>
+        <marker id="arr-c" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#56d4dd"/>
+        </marker>
+      </defs>
+      <rect width="1200" height="780" fill="var(--bg)"/>
+      <rect width="1200" height="780" fill="url(#grid)"/>
+
+      <!-- ──── Azure VNET Boundary (10.0.0.0/16) ──── -->
+      <rect x="170" y="45" width="680" height="530" rx="20" fill="rgba(88,166,255,0.03)" stroke="#58a6ff" stroke-width="2" stroke-dasharray="10,5"/>
+      <text x="190" y="73" fill="#58a6ff" font-size="13" font-weight="600">Azure VNET — 10.0.0.0/16</text>
+
+      <!-- AKS Cluster inside VNET -->
+      <rect x="200" y="95" width="400" height="450" rx="14" fill="rgba(63,185,80,0.03)" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6,4"/>
+      <text x="220" y="120" fill="#3fb950" font-size="12" font-weight="600">AKS Cluster — Subnet 10.0.1.0/24</text>
+      <text x="220" y="136" fill="#8b949e" font-size="10">Cilium CNI · Default-Deny · Workload Identity</text>
+
+      <!-- API Service -->
+      <g class="svg-node" data-component="api">
+        <rect x="230" y="160" width="160" height="72" rx="8" fill="#1a2332" stroke="#3fb950" stroke-width="1.5"/>
+        <text x="310" y="190" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">API Service</text>
+        <text x="310" y="208" text-anchor="middle" fill="#8b949e" font-size="10">REST + Registration</text>
+        <text x="310" y="222" text-anchor="middle" fill="#8b949e" font-size="9">az-rotator-api</text>
+      </g>
+
+      <!-- Scheduler -->
+      <g class="svg-node" data-component="scheduler">
+        <rect x="230" y="270" width="160" height="72" rx="8" fill="#1a2332" stroke="#d2a8ff" stroke-width="1.5"/>
+        <text x="310" y="300" text-anchor="middle" fill="#d2a8ff" font-size="12" font-weight="600">Scheduler</text>
+        <text x="310" y="318" text-anchor="middle" fill="#8b949e" font-size="10">Job Create + Publish</text>
+        <text x="310" y="332" text-anchor="middle" fill="#8b949e" font-size="9">az-rotator-scheduler</text>
+      </g>
+
+      <!-- System Tasks -->
+      <g class="svg-node" data-component="system-tasks">
+        <rect x="230" y="380" width="160" height="72" rx="8" fill="#1a2332" stroke="#f78166" stroke-width="1.5"/>
+        <text x="310" y="410" text-anchor="middle" fill="#f78166" font-size="12" font-weight="600">System Tasks</text>
+        <text x="310" y="428" text-anchor="middle" fill="#8b949e" font-size="10">7 CronJobs</text>
+        <text x="310" y="442" text-anchor="middle" fill="#8b949e" font-size="9">az-rotator-system</text>
+      </g>
+
+      <!-- ESO (bottom-right inside AKS, away from lines) -->
+      <g class="svg-node" data-component="eso">
+        <rect x="430" y="470" width="120" height="42" rx="6" fill="#1a2332" stroke="#a5d6ff" stroke-width="1.2"/>
+        <text x="490" y="491" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="600">ESO</text>
+        <text x="490" y="505" text-anchor="middle" fill="#8b949e" font-size="8">Secret Sync from KV</text>
+      </g>
+
+      <!-- PostgreSQL (right side of VNET, outside AKS) -->
+      <g class="svg-node" data-component="postgres">
+        <rect x="650" y="300" width="160" height="72" rx="8" fill="#1a2332" stroke="#79c0ff" stroke-width="1.5"/>
+        <text x="730" y="330" text-anchor="middle" fill="#79c0ff" font-size="12" font-weight="600">PostgreSQL</text>
+        <text x="730" y="348" text-anchor="middle" fill="#8b949e" font-size="10">Private Endpoint</text>
+        <text x="730" y="362" text-anchor="middle" fill="#8b949e" font-size="9">RLS + Partitioned</text>
+      </g>
+
+      <!-- Service Bus (right side of VNET, outside AKS) -->
+      <g class="svg-node" data-component="servicebus">
+        <rect x="650" y="140" width="160" height="72" rx="8" fill="#1a2332" stroke="#f0883e" stroke-width="1.5"/>
+        <text x="730" y="168" text-anchor="middle" fill="#f0883e" font-size="12" font-weight="600">Service Bus</text>
+        <text x="730" y="186" text-anchor="middle" fill="#8b949e" font-size="10">Topic per Tenant</text>
+        <text x="730" y="200" text-anchor="middle" fill="#8b949e" font-size="9">DLQ + TTL (1h)</text>
+      </g>
+
+      <!-- Key Vault (right side of VNET, below PostgreSQL) -->
+      <g class="svg-node" data-component="keyvault">
+        <rect x="650" y="440" width="160" height="60" rx="8" fill="#1a2332" stroke="#a5d6ff" stroke-width="1.5"/>
+        <text x="730" y="467" text-anchor="middle" fill="#a5d6ff" font-size="12" font-weight="600">Key Vault</text>
+        <text x="730" y="487" text-anchor="middle" fill="#8b949e" font-size="10">Platform Secrets</text>
+      </g>
+
+      <!-- APIM (in VNET subnet 10.0.2.0/24) -->
+      <g class="svg-node" data-component="apim">
+        <rect x="30" y="210" width="115" height="80" rx="8" fill="#1a2332" stroke="#58a6ff" stroke-width="2"/>
+        <text x="87" y="240" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="600">APIM</text>
+        <text x="87" y="258" text-anchor="middle" fill="#8b949e" font-size="9">Gateway</text>
+        <text x="87" y="272" text-anchor="middle" fill="#8b949e" font-size="9">10.0.2.0/24</text>
+      </g>
+      <!-- APIM VNET marker -->
+      <rect x="20" y="195" width="135" height="108" rx="10" fill="none" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4,3" opacity="0.4"/>
+
+      <!-- ──── External: Users (left, outside VNET) ──── -->
+      <g class="svg-node" data-component="users">
+        <rect x="25" y="410" width="110" height="55" rx="8" fill="#1a2332" stroke="#8b949e" stroke-width="1.5"/>
+        <text x="80" y="435" text-anchor="middle" fill="#8b949e" font-size="12" font-weight="600">Users</text>
+        <text x="80" y="453" text-anchor="middle" fill="#8b949e" font-size="10">Azure AD Login</text>
+      </g>
+
+      <!-- ──── External: Worker (bottom-right, outside VNET) ──── -->
+      <g class="svg-node" data-component="worker">
+        <rect x="880" y="580" width="180" height="85" rx="10" fill="#1a2332" stroke="#58a6ff" stroke-width="2"/>
+        <text x="970" y="608" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="600">Worker Agent</text>
+        <text x="970" y="626" text-anchor="middle" fill="#8b949e" font-size="10">Container App (MI)</text>
+        <text x="970" y="642" text-anchor="middle" fill="#8b949e" font-size="9">Tenant VNET · Plugin-based</text>
+        <text x="970" y="657" text-anchor="middle" fill="#8b949e" font-size="9">Customer-owned infra</text>
+      </g>
+
+      <!-- ──── External: Observability (top-right, OUTSIDE VNET) ──── -->
+      <g class="svg-node" data-component="observability">
+        <rect x="920" y="55" width="170" height="72" rx="8" fill="#1a2332" stroke="#56d4dd" stroke-width="1.5"/>
+        <text x="1005" y="83" text-anchor="middle" fill="#56d4dd" font-size="12" font-weight="600">Observability</text>
+        <text x="1005" y="103" text-anchor="middle" fill="#8b949e" font-size="10">OTel → Log Analytics</text>
+        <text x="1005" y="119" text-anchor="middle" fill="#8b949e" font-size="9">App Insights + Grafana</text>
+      </g>
+
+      <!-- ══════ Connections ══════ -->
+
+      <!-- Users → APIM -->
+      <line x1="80" y1="410" x2="80" y2="290" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="90" y="360" fill="#8b949e" font-size="8">HTTPS</text>
+
+      <!-- APIM → API -->
+      <line x1="145" y1="245" x2="230" y2="200" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+      <!-- API → PostgreSQL -->
+      <line x1="390" y1="220" x2="650" y2="320" stroke="#3fb950" stroke-width="1.3" marker-end="url(#arr-g)"/>
+      <text x="510" y="255" fill="#8b949e" font-size="8">read/write</text>
+
+      <!-- Scheduler → PostgreSQL -->
+      <line x1="390" y1="315" x2="650" y2="335" stroke="#d2a8ff" stroke-width="1.3" marker-end="url(#arr-p)"/>
+      <text x="510" y="310" fill="#8b949e" font-size="8">poll + write</text>
+
+      <!-- System Tasks → PostgreSQL -->
+      <line x1="390" y1="410" x2="650" y2="355" stroke="#f78166" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arr-o)"/>
+      <text x="510" y="395" fill="#8b949e" font-size="8">reconcile (RLS bypass)</text>
+
+      <!-- Scheduler → Service Bus (publish) -->
+      <line x1="390" y1="285" x2="650" y2="194" stroke="#d2a8ff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="510" y="225" fill="#8b949e" font-size="8">publish jobs</text>
+
+      <!-- System Tasks → Service Bus (DLQ drain) -->
+      <path d="M 390 395 Q 550 340 650 210" fill="none" stroke="#f78166" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr-o)"/>
+      <text x="545" y="320" fill="#8b949e" font-size="8">DLQ drain</text>
+
+      <!-- Worker → Service Bus (subscribe — arrow points AT Service Bus FROM worker) -->
+      <path d="M 920 580 Q 870 400 810 212" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="875" y="390" fill="#8b949e" font-size="9">subscribe</text>
+
+      <!-- Worker → APIM (heartbeat/status callbacks) -->
+      <path d="M 880 640 Q 450 680 87 290" fill="none" stroke="#58a6ff" stroke-width="1" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+
+      <!-- ESO → Key Vault (sync) -->
+      <line x1="550" y1="491" x2="650" y2="470" stroke="#a5d6ff" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arr)"/>
+      <text x="580" y="472" fill="#8b949e" font-size="8">sync</text>
+
+      <!-- Services → Observability (telemetry — originates from AKS top edge) -->
+      <path d="M 400 95 Q 650 30 920 75" fill="none" stroke="#56d4dd" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arr-c)"/>
+      <text x="650" y="42" fill="#56d4dd" font-size="8">telemetry</text>
+
+      <!-- ══════ Legend ══════ -->
+      <g transform="translate(30, 590)">
+        <text x="0" y="0" fill="#8b949e" font-size="11" font-weight="600">Legend</text>
+        <line x1="0" y1="18" x2="30" y2="18" stroke="#58a6ff" stroke-width="1.5"/>
+        <text x="36" y="22" fill="#8b949e" font-size="10">Synchronous flow</text>
+        <line x1="0" y1="38" x2="30" y2="38" stroke="#f78166" stroke-width="1.2" stroke-dasharray="4,3"/>
+        <text x="36" y="42" fill="#8b949e" font-size="10">System task (CronJob)</text>
+        <line x1="0" y1="58" x2="30" y2="58" stroke="#58a6ff" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="36" y="62" fill="#8b949e" font-size="10">Worker callback (async)</text>
+        <line x1="0" y1="78" x2="30" y2="78" stroke="#56d4dd" stroke-width="1" stroke-dasharray="3,3"/>
+        <text x="36" y="82" fill="#8b949e" font-size="10">Telemetry export</text>
+        <rect x="200" y="10" width="16" height="16" rx="3" fill="rgba(88,166,255,0.03)" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,3"/>
+        <text x="222" y="22" fill="#8b949e" font-size="10">VNET boundary</text>
+        <rect x="200" y="32" width="16" height="16" rx="3" fill="rgba(63,185,80,0.03)" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4,3"/>
+        <text x="222" y="44" fill="#8b949e" font-size="10">AKS cluster subnet</text>
+      </g>
+    </svg>
+  </div>
+  <p class="hint">Click any component for details.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════ FLOWS ═══════════════════════════════════════════════ -->
+<div class="page" id="page-flows">
+
+  <div class="flow-category">Core Rotation Flows</div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">1</span> Scheduled Rotation (Happy Path)</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Scheduler</strong> polls DB — finds secret with <code>next_rotation_at &lt;= NOW()</code> and active policy</div>
+      <div class="flow-step"><strong>Scheduler</strong> creates <code>rotation_jobs</code> row (PENDING) — snapshots <code>max_attempts</code> from policy</div>
+      <div class="flow-step"><strong>Scheduler</strong> checks worker is APPROVED + last heartbeat &lt; 5 min ago</div>
+      <div class="flow-step"><strong>Scheduler</strong> publishes message to tenant's Service Bus topic → job PUBLISHED</div>
+      <div class="flow-step"><strong>Worker</strong> receives message from subscription, reports RUNNING via API callback</div>
+      <div class="flow-step"><strong>Worker</strong> executes rotation plugin (create new credential on target resource)</div>
+      <div class="flow-step"><strong>Worker</strong> stores new secret version in tenant's Key Vault</div>
+      <div class="flow-step"><strong>Worker</strong> validates credential if <code>validation_required = true</code> (policy)</div>
+      <div class="flow-step"><strong>Worker</strong> reports COMPLETED → API resets <code>next_rotation_at = NOW() + rotation_interval</code></div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">2</span> Manual Rotation (On-Demand)</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Tenant Admin</strong> calls <code>POST /api/tenants/{tid}/secrets/{sid}/rotate</code></div>
+      <div class="flow-step"><strong>API</strong> creates rotation_job (PENDING) with <code>trigger = 'manual'</code></div>
+      <div class="flow-step"><strong>Scheduler</strong> picks up PENDING job on next publish loop (≤60s)</div>
+      <div class="flow-step">Same flow as scheduled from step 4 onward</div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">3</span> Worker Onboarding</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Worker</strong> starts → acquires MI token from Azure AD (client_credentials)</div>
+      <div class="flow-step"><strong>Worker</strong> calls <code>POST /api/workers/register</code> through APIM with JWT</div>
+      <div class="flow-step"><strong>APIM</strong> validates JWT (issuer, audience, MI object ID claim)</div>
+      <div class="flow-step"><strong>API</strong> creates worker record with status = PENDING_APPROVAL</div>
+      <div class="flow-step"><strong>Tenant Admin</strong> reviews and approves → status = APPROVED</div>
+      <div class="flow-step"><strong>API</strong> grants Service Bus Data Receiver on tenant subscription</div>
+      <div class="flow-step"><strong>Worker</strong> subscribes to rotation messages + starts heartbeats (60s interval)</div>
+    </div>
+  </div>
+
+  <div class="flow-category">Policy Flows</div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">4</span> Policy Creation & Assignment</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Tenant Admin</strong> creates policy: <code>POST /api/tenants/{tid}/policies</code> — rotation_interval, max_retry, backoff_base, validation_required</div>
+      <div class="flow-step"><strong>API</strong> validates <code>secret_lifetime &gt; rotation_interval</code> (enforces safety buffer)</div>
+      <div class="flow-step"><strong>Tenant Admin</strong> assigns policy to secret: <code>PATCH /api/tenants/{tid}/secrets/{sid}</code></div>
+      <div class="flow-step"><strong>API</strong> computes <code>next_rotation_at = NOW() + rotation_interval</code></div>
+      <div class="flow-step">Scheduler now sees this secret in its polling query when rotation is due</div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">5</span> Policy Evaluation by Scheduler</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Scheduler</strong> JOINs <code>secret_registrations</code> + <code>rotation_policies</code> on policy_id</div>
+      <div class="flow-step">Filters: status=ACTIVE, policy assigned, <code>next_rotation_at &lt;= NOW()</code>, no active job</div>
+      <div class="flow-step">Snapshots <code>max_retry_attempts</code> + <code>validation_required</code> into job (immutable for job lifetime)</div>
+      <div class="flow-step"><code>retry_backoff_base</code> NOT copied — read live so policy updates take immediate effect</div>
+      <div class="flow-step">After COMPLETED, API resets <code>next_rotation_at</code> using current policy interval</div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">6</span> Policy Update Behavior</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Admin</strong> updates policy (e.g., rotation_interval 30d → 7d)</div>
+      <div class="flow-step">Existing secrets: no recomputation of next_rotation_at (avoids thundering herd)</div>
+      <div class="flow-step">In-flight jobs: unaffected — max_attempts already snapshotted</div>
+      <div class="flow-step"><code>retry_backoff_base</code>: immediate effect (read live by Retry Promoter)</div>
+      <div class="flow-step">Next natural rotation cycle uses new interval going forward</div>
+    </div>
+  </div>
+
+  <div class="flow-category">System Task Flows</div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">7</span> Job Reconciliation (every 5 min)</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Job Reconciler</strong> finds PUBLISHED jobs &gt; 1 hour old → resets to PENDING (publish was lost/expired)</div>
+      <div class="flow-step">Finds RUNNING jobs &gt; 30 min old → marks FAILED ("worker unresponsive")</div>
+      <div class="flow-step">Finds VALIDATING jobs &gt; 15 min old → marks FAILED (validation hung)</div>
+      <div class="flow-step">Each state change writes audit_logs entry with reason code</div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">8</span> Retry Promotion (every 5 min)</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Retry Promoter</strong> finds FAILED jobs where <code>attempt &lt; max_attempts</code></div>
+      <div class="flow-step">Calculates backoff: <code>base × 2^(attempt-1)</code> → e.g. 5m, 10m, 20m</div>
+      <div class="flow-step">If past backoff window: resets to PENDING, increments attempt counter</div>
+      <div class="flow-step">Scheduler picks up re-PENDING'd job in next publish loop → retry begins</div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">9</span> Dead-Letter Promotion (every 5 min)</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Dead-Letter Promoter</strong> finds FAILED jobs where <code>attempt &gt;= max_attempts</code></div>
+      <div class="flow-step">Sets status DEAD_LETTERED — job is now terminal</div>
+      <div class="flow-step">Audit log: <code>job.dead_lettered</code> (future: tenant notification)</div>
+      <div class="flow-step">Requires manual intervention — admin must investigate and re-trigger</div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">10</span> DLQ Drainer (every 5 min)</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>DLQ Drainer</strong> peeks Service Bus dead-letter queues per tenant (up to 50 msgs)</div>
+      <div class="flow-step">Extracts job_id from message properties → looks up job in DB</div>
+      <div class="flow-step">If not already terminal → marks FAILED with DLQ reason</div>
+      <div class="flow-step">Completes (removes) DLQ message — Retry Promoter handles rest</div>
+      <div class="flow-step">Alerts if DLQ depth &gt; 20 (worker may be broken)</div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">11</span> Worker Health Monitor (every 2 min)</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Health Monitor</strong> finds APPROVED workers with last_heartbeat &gt; 5 min ago</div>
+      <div class="flow-step">Sets worker SUSPENDED → no new jobs published to it</div>
+      <div class="flow-step">Removes Service Bus Data Receiver RBAC from worker's MI</div>
+      <div class="flow-step">In-flight RUNNING job caught by Job Reconciler (30 min threshold)</div>
+      <div class="flow-step">Self-heal path: worker resumes heartbeats → admin re-approves → RBAC restored</div>
+    </div>
+  </div>
+
+  <div class="flow-section">
+    <div class="flow-title"><span class="flow-num">12</span> Cleanup Tasks (daily)</div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>Heartbeat Cleanup</strong> (02:00 UTC): purges worker_heartbeats &gt; 30 days</div>
+      <div class="flow-step"><strong>Audit Log Cleanup</strong> (03:00 UTC): purges audit_logs &gt; 90 days</div>
+      <div class="flow-step">If partitioned → DROP TABLE (instant). Otherwise batched DELETE (LIMIT 10000)</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════════════════════════════════ SECURITY ═══════════════════════════════════════════════ -->
+<div class="page" id="page-security">
+  <div class="sec-header">Security Architecture & Controls</div>
+  <div class="sec-grid">
+
+    <div class="sec-card">
+      <h3>Identity & Authentication</h3>
+      <ul>
+        <li>Workers: Azure Managed Identity → client_credentials JWT</li>
+        <li>Users: Azure AD interactive login (PKCE authorization code)</li>
+        <li>APIM validates JWT at the edge (issuer, audience, expiry, claims)</li>
+        <li>APIM injects its own MI token as X-Gateway-Auth (defense-in-depth)</li>
+        <li>Backend verifies BOTH caller JWT + gateway MI token</li>
+        <li>No shared secrets — all identity is MI/certificate-based</li>
+      </ul>
+    </div>
+
+    <div class="sec-card">
+      <h3>Network Security</h3>
+      <ul>
+        <li>Dedicated VNET (10.0.0.0/16) — AKS subnet + APIM subnet</li>
+        <li>Cilium CNI with default-deny across all namespaces</li>
+        <li>Explicit allow rules only for documented flows</li>
+        <li>L7 HTTP policies for path/method control</li>
+        <li>PostgreSQL via private endpoint only (no public access)</li>
+        <li>Service Bus accessed via MI RBAC (no connection strings)</li>
+        <li>Workers in separate customer VNETs (network isolation)</li>
+      </ul>
+    </div>
+
+    <div class="sec-card">
+      <h3>Authorization & Tenant Isolation</h3>
+      <ul>
+        <li>PostgreSQL Row-Level Security (RLS) — all queries scoped to tenant_id</li>
+        <li>System Tasks bypass RLS via <code>az_rotator_system</code> role</li>
+        <li>Service Bus topic-scoped RBAC — workers access own tenant topic only</li>
+        <li>Platform RBAC via Azure AD App Roles (TenantAdmin, Operator)</li>
+        <li>Worker approval gate — admin must approve before access</li>
+        <li>Policy/secret CRUD scoped to tenant membership</li>
+      </ul>
+    </div>
+
+    <div class="sec-card">
+      <h3>Pod Security (All Services)</h3>
+      <ul>
+        <li>runAsNonRoot: true (UID 65534 in distroless)</li>
+        <li>allowPrivilegeEscalation: false</li>
+        <li>capabilities.drop: ["ALL"]</li>
+        <li>readOnlyRootFilesystem: true</li>
+        <li>Resource requests/limits enforced</li>
+        <li>No service account token auto-mount</li>
+        <li>distroless/static — no shell, no package manager</li>
+      </ul>
+    </div>
+
+    <div class="sec-card">
+      <h3>Secrets Management</h3>
+      <ul>
+        <li>External Secrets Operator (ESO) syncs from Key Vault</li>
+        <li>K8s Secrets as runtime delivery (never env vars or configmaps)</li>
+        <li>Key Vault access via Workload Identity (no static creds)</li>
+        <li>Auto-refresh on configurable interval</li>
+        <li>Worker credentials never transit the control plane</li>
+        <li>Tenant Key Vaults are customer-owned (MI RBAC)</li>
+      </ul>
+    </div>
+
+    <div class="sec-card">
+      <h3>Queue Poisoning Prevention</h3>
+      <ul>
+        <li>Only Scheduler MI has Service Bus Data Sender role</li>
+        <li>Workers: Data Receiver on their subscription only</li>
+        <li>Topic-scoped RBAC prevents cross-tenant injection</li>
+        <li>Cilium blocks pod→SB egress except Scheduler namespace</li>
+        <li>No shared keys or connection strings — all MI-based</li>
+        <li>DLQ Drainer reconciles poisoned messages to DB state</li>
+      </ul>
+    </div>
+
+    <div class="sec-card">
+      <h3>Audit & Observability</h3>
+      <ul>
+        <li>Append-only audit_logs table (partitioned, 90-day retention)</li>
+        <li>Structured JSON logging with correlation IDs</li>
+        <li>OpenTelemetry → App Insights (traces + dependencies)</li>
+        <li>Log Analytics for centralized KQL queries</li>
+        <li>All system task actions logged with reason codes</li>
+        <li>Grafana dashboards for rotation SLAs and health</li>
+      </ul>
+    </div>
+
+    <div class="sec-card">
+      <h3>Defense in Depth Layers</h3>
+      <ul>
+        <li><strong>Edge:</strong> APIM JWT validation + rate limiting</li>
+        <li><strong>Network:</strong> VNET isolation + Cilium default-deny + private endpoints</li>
+        <li><strong>Transport:</strong> TLS everywhere (HTTPS, encrypted Service Bus)</li>
+        <li><strong>Application:</strong> Dual-token verification (caller + gateway)</li>
+        <li><strong>Data:</strong> RLS, encryption at rest, private endpoint access</li>
+        <li><strong>Operational:</strong> Worker approval gate, RBAC separation, CronJob hygiene</li>
+      </ul>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════ Detail Panel ═══════════════ -->
+<div class="overlay" id="overlay"></div>
+<div class="detail-panel" id="detail-panel">
+  <div class="detail-panel-header">
+    <h2 id="detail-title"></h2>
+    <button class="close" id="detail-close">&times;</button>
+  </div>
+  <div class="detail-panel-body" id="detail-body"></div>
+</div>
+
+<script>
+const components = {
+  apim: {
+    title: 'APIM Gateway',
+    desc: 'Azure API Management — the single public entry point. All external traffic (workers and tenant admins) flows through here. Deployed in its own subnet (10.0.2.0/24) within the platform VNET.',
+    sections: [
+      { title: 'Responsibilities', items: [
+        'JWT validation at the edge (issuer, audience, expiry, claims)',
+        'Caller type detection — user (roles claim) vs worker (MI object ID)',
+        'Acquires own MI token → injects as X-Gateway-Auth header',
+        'Rate limiting per tenant / per caller',
+        'Request routing to backend API service in AKS',
+        'Header enrichment (tenant context, correlation ID)'
+      ]},
+      { title: 'Auth Flow', items: [
+        'Validates incoming caller JWT up front',
+        'Acquires its own Managed Identity token',
+        'Forwards both to backend for defense-in-depth verification',
+        'Backend rejects if either token is missing/invalid'
+      ]}
+    ],
+    badges: [
+      { text: 'Dual-Auth', cls: 'dbadge-blue' },
+      { text: 'Rate Limiting', cls: 'dbadge-green' },
+      { text: 'Header Enrichment', cls: 'dbadge-purple' },
+      { text: '10.0.2.0/24', cls: 'dbadge-cyan' }
+    ]
+  },
+  api: {
+    title: 'API Service',
+    desc: 'Go REST service handling all external interactions — tenant management, worker registration and approval, secret registration, policy CRUD, manual rotation triggers, and audit log queries. Deployed as a Deployment (1 replica MVP) in the az-rotator-api namespace.',
+    sections: [
+      { title: 'Key Endpoints', items: [
+        'POST /api/workers/register — worker onboarding',
+        'POST /api/tenants/{tid}/secrets/{sid}/rotate — manual trigger',
+        'POST /api/tenants/{tid}/policies — policy CRUD',
+        'PATCH /api/tenants/{tid}/secrets/{sid} — policy assignment',
+        'GET /api/tenants/{tid}/audit — audit log queries',
+        'POST /api/rotations/{jobId}/status — worker status callbacks'
+      ]},
+      { title: 'Security Model', items: [
+        'Verifies X-Gateway-Auth (APIM MI token) — ensures traffic came via gateway',
+        'Verifies caller JWT (user or worker identity)',
+        'All DB queries scoped by tenant_id via RLS',
+        'Workload Identity for PostgreSQL and Service Bus auth'
+      ]},
+      { title: 'Post-Completion Logic', items: [
+        'On job COMPLETED: resets next_rotation_at = NOW() + policy.rotation_interval',
+        'On worker approved: grants Service Bus Data Receiver on tenant subscription',
+        'On policy assigned: computes initial next_rotation_at'
+      ]}
+    ],
+    badges: [
+      { text: 'Go', cls: 'dbadge-green' },
+      { text: '1 replica (MVP)', cls: 'dbadge-green' },
+      { text: 'Workload Identity', cls: 'dbadge-blue' },
+      { text: 'az-rotator-api', cls: 'dbadge-purple' }
+    ]
+  },
+  scheduler: {
+    title: 'Scheduler',
+    desc: 'Long-running Go control-loop service — the bridge between database state and Service Bus. Polls the DB for secrets due for rotation, creates job records, validates worker health, and publishes messages. Exactly 1 replica (leader, no HA yet).',
+    sections: [
+      { title: 'Two Control Loops', items: [
+        'Job Creator: every 60s — polls secret_registrations WHERE next_rotation_at <= NOW()',
+        'Job Publisher: every 30s — finds PENDING jobs, validates worker, publishes to Service Bus'
+      ]},
+      { title: 'Pre-Publish Checks', items: [
+        'Worker status = APPROVED (skip suspended/pending)',
+        'Worker last_heartbeat_at < 5 min ago (alive)',
+        'Tenant status = ACTIVE (not deactivated)',
+        'No duplicate active job for same secret (idempotent)'
+      ]},
+      { title: 'Policy Integration', items: [
+        'JOINs rotation_policies to get max_retry_attempts, validation_required',
+        'Snapshots these into the job row at creation time',
+        'retry_backoff_base is NOT snapshotted — read live by Retry Promoter'
+      ]}
+    ],
+    badges: [
+      { text: 'Go', cls: 'dbadge-purple' },
+      { text: '1 replica', cls: 'dbadge-purple' },
+      { text: 'Workload Identity', cls: 'dbadge-blue' },
+      { text: 'az-rotator-scheduler', cls: 'dbadge-purple' }
+    ]
+  },
+  'system-tasks': {
+    title: 'System Tasks',
+    desc: 'Seven Kubernetes CronJobs for platform hygiene. All use the same container image (az-rotator-system-tasks) with different subcommands. Run in az-rotator-system namespace with the az_rotator_system DB role that bypasses RLS for cross-tenant operations.',
+    sections: [
+      { title: 'CronJobs', items: [
+        'Job Reconciler (*/5) — detects stale PUBLISHED/RUNNING/VALIDATING jobs',
+        'Retry Promoter (*/5) — promotes FAILED jobs to PENDING with exponential backoff',
+        'Dead-Letter Promoter (*/5) — marks exhausted retries as DEAD_LETTERED',
+        'DLQ Drainer (*/5) — reconciles Service Bus DLQ messages to DB state',
+        'Worker Health Monitor (*/2) — suspends workers with expired heartbeats',
+        'Heartbeat Cleanup (daily 02:00) — purges heartbeats > 30 days',
+        'Audit Log Cleanup (daily 03:00) — purges audit_logs > 90 days'
+      ]},
+      { title: 'DB Role', items: [
+        'Uses az_rotator_system role — SET ROLE bypasses tenant RLS',
+        'Can read/write across all tenants (needed for reconciliation)',
+        'Service Bus Data Receiver at namespace level (for DLQ access)'
+      ]},
+      { title: 'Recovery Chain', items: [
+        'Stale job → Reconciler marks FAILED → Retry Promoter retries → Dead-Letter Promoter terminates',
+        'DLQ message → Drainer marks FAILED → same retry chain',
+        'Dead worker → Health Monitor suspends → admin re-approves when fixed'
+      ]}
+    ],
+    badges: [
+      { text: 'CronJobs (7)', cls: 'dbadge-orange' },
+      { text: 'Same image', cls: 'dbadge-orange' },
+      { text: 'RLS bypass', cls: 'dbadge-orange' },
+      { text: 'az-rotator-system', cls: 'dbadge-purple' }
+    ]
+  },
+  postgres: {
+    title: 'PostgreSQL',
+    desc: 'Azure Database for PostgreSQL (Flexible Server) — single instance MVP. Accessed exclusively via private endpoint in the AKS subnet. Row-Level Security enforces tenant isolation at the data layer. Partitioned tables for high-write tables.',
+    sections: [
+      { title: 'Key Tables', items: [
+        'tenants / tenant_members — multi-tenancy foundation',
+        'secret_registrations — what to rotate (+ next_rotation_at, policy_id)',
+        'rotation_policies — reusable policy templates per tenant',
+        'rotation_jobs — state machine (PENDING→PUBLISHED→RUNNING→COMPLETED)',
+        'workers / worker_heartbeats — worker registry and health',
+        'audit_logs — append-only trail of all state changes'
+      ]},
+      { title: 'Security', items: [
+        'Private endpoint only — no public network access',
+        'Row-Level Security on all tenant-scoped tables',
+        'Workload Identity connections (no passwords in config)',
+        'az_rotator_system role for CronJobs (RLS bypass)',
+        'Partitioned by month: audit_logs, worker_heartbeats'
+      ]}
+    ],
+    badges: [
+      { text: 'Private Endpoint', cls: 'dbadge-blue' },
+      { text: 'RLS', cls: 'dbadge-green' },
+      { text: 'Partitioned', cls: 'dbadge-purple' },
+      { text: 'Workload Identity', cls: 'dbadge-blue' }
+    ]
+  },
+  servicebus: {
+    title: 'Azure Service Bus',
+    desc: 'Job distribution backbone. Standard tier, one shared namespace. Topic-per-tenant architecture with a single subscription per worker. Messages represent rotation jobs. MI-based RBAC — no connection strings anywhere.',
+    sections: [
+      { title: 'Topology', items: [
+        'Namespace: az-rotator-servicebus',
+        'Topic per tenant: tenant-{slug}-rotations',
+        'One subscription per topic: "worker" (1 worker per tenant)',
+        'Dead-letter queue on each subscription',
+        'Message TTL: 1 hour (aligns with Job Reconciler threshold)'
+      ]},
+      { title: 'Message Schema', items: [
+        'MessageId = job UUID (deduplication)',
+        'App properties: tenant_id, secret_id, job_id, secret_type, attempt_number',
+        'Body: full rotation context (vault_uri, plugin config, policy flags)',
+        'Subject: "rotation-job" (discriminator for future message types)'
+      ]},
+      { title: 'RBAC', items: [
+        'Scheduler MI: Data Sender (namespace-scoped) — publishes jobs',
+        'Worker MI: Data Receiver (subscription-scoped) — receives own jobs only',
+        'System Tasks MI: Data Receiver (namespace-scoped) — drains DLQs across tenants'
+      ]}
+    ],
+    badges: [
+      { text: 'Topic/Sub per tenant', cls: 'dbadge-orange' },
+      { text: 'MI RBAC', cls: 'dbadge-blue' },
+      { text: 'DLQ', cls: 'dbadge-green' },
+      { text: 'Standard Tier', cls: 'dbadge-cyan' }
+    ]
+  },
+  keyvault: {
+    title: 'Azure Key Vault',
+    desc: 'Platform Key Vault stores control plane secrets (DB config, etc.). External Secrets Operator reads from vault and syncs into Kubernetes Secrets. Services never access Key Vault at runtime directly. Tenant Key Vaults are separate customer-owned resources.',
+    sections: [
+      { title: 'Platform Vault Contents', items: [
+        'Database connection parameters',
+        'Service Bus namespace configuration',
+        'Any platform certificates',
+        'Synced to K8s Secrets via ESO (auto-refresh)'
+      ]},
+      { title: 'Access Pattern', items: [
+        'ESO authenticates via Workload Identity',
+        'Polls Key Vault on configurable interval',
+        'Creates/updates K8s Secrets in each namespace',
+        'Services mount K8s Secrets as volumes or env'
+      ]},
+      { title: 'Tenant Key Vaults (Separate)', items: [
+        'Owned by tenant (in their subscription/VNET)',
+        'Worker MI has Key Vault Secrets Officer role',
+        'Worker stores rotated credentials here',
+        'Control plane never touches tenant vaults'
+      ]}
+    ],
+    badges: [
+      { text: 'ESO Sync', cls: 'dbadge-blue' },
+      { text: 'Workload Identity', cls: 'dbadge-blue' },
+      { text: 'Auto-refresh', cls: 'dbadge-green' }
+    ]
+  },
+  cilium: {
+    title: 'Cilium CNI',
+    desc: 'eBPF-based networking with default-deny network policies. Replaces kube-proxy. Each namespace gets explicit CiliumNetworkPolicy resources allowing only required traffic. Provides L7 (HTTP) visibility and enforcement.',
+    sections: [
+      { title: 'Default-Deny Posture', items: [
+        'All ingress denied unless explicitly allowed (per namespace)',
+        'All egress denied unless explicitly allowed (per namespace)',
+        'Cross-namespace traffic requires bilateral allow rules',
+        'Applied cluster-wide via CiliumClusterwideNetworkPolicy'
+      ]},
+      { title: 'Namespace Policies', items: [
+        'az-rotator-api: ingress from APIM subnet only',
+        'az-rotator-scheduler: egress to PostgreSQL PE + Service Bus',
+        'az-rotator-system: egress to PostgreSQL PE + Service Bus',
+        'All namespaces: egress to Azure AD (login.microsoftonline.com) for token refresh',
+        'All namespaces: egress to Key Vault (ESO sync)'
+      ]},
+      { title: 'L7 Enforcement', items: [
+        'HTTP path/method restrictions on API ingress',
+        'DNS-based egress policies (FQDN allowlists)',
+        'Hubble for flow visibility and troubleshooting'
+      ]}
+    ],
+    badges: [
+      { text: 'Default-Deny', cls: 'dbadge-green' },
+      { text: 'L7 Policy', cls: 'dbadge-blue' },
+      { text: 'eBPF', cls: 'dbadge-purple' },
+      { text: 'Hubble', cls: 'dbadge-cyan' }
+    ]
+  },
+  eso: {
+    title: 'External Secrets Operator',
+    desc: 'Kubernetes operator that reads secrets from Azure Key Vault and syncs them into native K8s Secret resources. Keeps runtime config fresh without manual intervention or secret rotation restarts.',
+    sections: [
+      { title: 'How It Works', items: [
+        'SecretStore CRD configured per namespace (points to platform Key Vault)',
+        'ExternalSecret CRDs define which vault secrets to sync',
+        'ESO controller polls vault on interval (e.g., every 5 min)',
+        'Creates/updates K8s Secrets with latest values',
+        'Pods referencing those Secrets get updated values on next mount refresh'
+      ]},
+      { title: 'Authentication', items: [
+        'Uses Workload Identity (Azure AD Federated Credential)',
+        'ESO service account bound to Azure AD app registration',
+        'Key Vault access policy: GET secrets only (least privilege)',
+        'No static credentials stored anywhere'
+      ]}
+    ],
+    badges: [
+      { text: 'Operator', cls: 'dbadge-blue' },
+      { text: 'Auto-sync', cls: 'dbadge-green' },
+      { text: 'Workload Identity', cls: 'dbadge-blue' }
+    ]
+  },
+  worker: {
+    title: 'Worker Agent',
+    desc: 'Distributed Go binary running as an Azure Container App in the tenant\'s own VNET. Has private network access to the resources it rotates (DBs, Key Vaults, etc.) that the control plane cannot reach. Authenticates everywhere with its system-assigned Managed Identity.',
+    sections: [
+      { title: 'Lifecycle', items: [
+        'Starts → acquires MI JWT → registers with platform via APIM',
+        'Awaits admin approval (PENDING_APPROVAL → APPROVED)',
+        'RBAC granted: Service Bus Data Receiver on tenant subscription',
+        'Subscribes to Service Bus topic, sends heartbeats every 60s',
+        'Receives rotation messages → executes plugin → reports status'
+      ]},
+      { title: 'Plugin System', items: [
+        'PostgreSQL',
+        'Azure AD App Registration',
+        'Storage Account Key',
+        'GitHub PAT',
+        'MySQL',
+        'Databricks PAT',
+        'Custom plugins via Go interface (Rotate + Validate methods)',
+        'Plugin selected by secret_type field in job message'
+      ]},
+      { title: 'Network Position', items: [
+        'Runs in tenant\'s VNET (customer-owned subscription)',
+        'Private access to tenant resources (DBs, Key Vaults)',
+        'Outbound only: APIM (register, heartbeat, callbacks) + Service Bus (receive)',
+        'Control plane never has network path to tenant resources'
+      ]}
+    ],
+    badges: [
+      { text: 'Managed Identity', cls: 'dbadge-blue' },
+      { text: 'Container App', cls: 'dbadge-green' },
+      { text: 'Plugin System', cls: 'dbadge-purple' },
+      { text: 'Tenant VNET', cls: 'dbadge-orange' }
+    ]
+  },
+  users: {
+    title: 'Users (Admins & Operators)',
+    desc: 'Human users authenticating via standard Azure AD interactive login (authorization code flow with PKCE). Access the platform API through APIM. Platform RBAC enforced via Azure AD App Roles assigned to the user.',
+    sections: [
+      { title: 'Capabilities', items: [
+        'Create and manage tenants + tenant members',
+        'Register secrets and assign rotation policies',
+        'Approve or suspend workers',
+        'Create rotation policies (interval, retry, validation settings)',
+        'Trigger manual rotations',
+        'View audit logs and job history'
+      ]},
+      { title: 'Authentication Flow', items: [
+        'Azure AD org account → authorization code + PKCE',
+        'JWT issued with app roles claim (TenantAdmin or Operator)',
+        'Token sent to APIM → validated → forwarded to API',
+        'API extracts user identity + roles from JWT'
+      ]},
+      { title: 'Authorization', items: [
+        'TenantAdmin: full CRUD on their tenants + approve workers',
+        'Operator: read-only + trigger manual rotations',
+        'Scoped to tenant memberships (can\'t access other tenants)',
+        'Platform-level super-admin role (future) for cross-tenant ops'
+      ]}
+    ],
+    badges: [
+      { text: 'Azure AD', cls: 'dbadge-blue' },
+      { text: 'PKCE Flow', cls: 'dbadge-green' },
+      { text: 'App Roles', cls: 'dbadge-purple' }
+    ]
+  },
+  observability: {
+    title: 'Observability Stack',
+    desc: 'Three pillars: metrics, logs, and traces. All Go services emit telemetry via OpenTelemetry SDK. Collected by OTel Collector (DaemonSet) and exported to Azure-native backends. Grafana for dashboards and alerting.',
+    sections: [
+      { title: 'Three Pillars', items: [
+        'Metrics: Prometheus (app-level) + Azure Monitor (infra)',
+        'Logs: Structured JSON → Log Analytics Workspace (KQL queryable)',
+        'Traces: Distributed traces → Application Insights (end-to-end flows)'
+      ]},
+      { title: 'Key Dashboards', items: [
+        'Rotation SLA: % of secrets rotated on time vs overdue',
+        'Job state machine: flow from PENDING → COMPLETED/DEAD_LETTERED',
+        'Worker health: heartbeat freshness, suspension rate',
+        'Service Bus: queue depth, DLQ accumulation, publish latency',
+        'System tasks: reconciliation counts, retry rates'
+      ]},
+      { title: 'Alerting', items: [
+        'Secrets overdue > 24h (rotation SLA breach)',
+        'DLQ depth > 20 messages (worker broken)',
+        'Worker suspended (heartbeat timeout)',
+        'Job reconciler marking > 5 stale jobs per run',
+        'API error rate > 5% (service degradation)'
+      ]}
+    ],
+    badges: [
+      { text: 'OpenTelemetry', cls: 'dbadge-cyan' },
+      { text: 'Log Analytics', cls: 'dbadge-blue' },
+      { text: 'App Insights', cls: 'dbadge-purple' },
+      { text: 'Grafana', cls: 'dbadge-green' }
+    ]
+  }
+};
+
+// Tab navigation
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('page-' + tab.dataset.page).classList.add('active');
+  });
+});
+
+// Detail panel
+const panel = document.getElementById('detail-panel');
+const overlay = document.getElementById('overlay');
+
+function openDetail(id) {
+  const c = components[id];
+  if (!c) return;
+  document.getElementById('detail-title').textContent = c.title;
+
+  let html = '<p class="desc">' + c.desc + '</p>';
+  c.sections.forEach(sec => {
+    html += '<div class="detail-section"><h4>' + sec.title + '</h4><ul>';
+    sec.items.forEach(item => { html += '<li>' + item + '</li>'; });
+    html += '</ul></div>';
+  });
+  if (c.badges) {
+    html += '<div class="detail-badges">';
+    c.badges.forEach(b => { html += '<span class="detail-badge ' + b.cls + '">' + b.text + '</span>'; });
+    html += '</div>';
+  }
+  document.getElementById('detail-body').innerHTML = html;
+  panel.classList.add('open');
+  overlay.classList.add('open');
+}
+
+function closeDetail() {
+  panel.classList.remove('open');
+  overlay.classList.remove('open');
+}
+
+document.querySelectorAll('.svg-node').forEach(node => {
+  node.addEventListener('click', () => openDetail(node.dataset.component));
+});
+document.getElementById('detail-close').addEventListener('click', closeDetail);
+overlay.addEventListener('click', closeDetail);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
+</script>
+</body>
+</html>

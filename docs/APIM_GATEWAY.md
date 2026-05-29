@@ -1,851 +1,380 @@
-# APIM Gateway - Detailed Design
+# APIM Gateway — Detailed Design
 
 ## Overview
-APIM acts as the **public entry point** for all worker and user requests. It handles:
-1. **JWT validation** (worker Managed Identity tokens)
-2. **Tenant isolation** enforcement (routing by tenant claim)
-3. **Rate limiting & throttling**
-4. **Request transformation** (headers, tenant context injection)
-5. **Secure forwarding** to AKS API service
+
+APIM is the **single public entry point** for all external traffic to the platform. Two kinds of clients call through APIM:
+
+| Client Type | Identity Source | Example Calls |
+|-------------|----------------|---------------|
+| **Users** (tenant admins / operators) | Normal Azure AD account (org account login) | Create tenants, approve workers, manage policies, view audit logs |
+| **Workers** (Container App agents) | Azure Managed Identity | Register, send heartbeats, report rotation status |
+
+APIM authenticates **every** inbound request (user or worker) by validating the caller's Azure AD JWT **before** any traffic reaches the backend. APIM then authenticates **itself** to the backend API using its own Managed Identity, creating a **dual-auth** model where every request that arrives at the API pod carries two verified identities.
+
+### Core Responsibilities
+
+1. **Client JWT validation** — verify signature, issuer, audience, expiry for both users and workers
+2. **Caller-type detection** — distinguish user vs worker from JWT claims and route context
+3. **Tenant isolation** — extract and enforce tenant scope from claims / headers
+4. **Rate limiting & throttling** — per-tenant and per-caller-type limits
+5. **APIM-to-backend authentication** — APIM acquires its own MI token and injects it as a second identity
+6. **Header enrichment** — inject verified caller metadata for downstream consumption
+7. **Secure forwarding** — route to AKS API service over private network
 
 ---
 
-## JWT Token Flow
+## Dual-Auth Model
 
-### Step 1: Worker Obtains JWT from Azure AD
+The platform uses two layers of authentication on every request:
+
 ```
-Worker Container App (with Managed Identity)
+                      ┌────────────────────────┐
+                      │ Client (User or Worker) │
+                      │ Identity #1: Client JWT │
+                      └───────────┬────────────┘
+                                  │
+                                  ▼
+                      ┌────────────────────────┐
+                      │       APIM Gateway      │
+                      │                        │
+                      │  1. Validate Client JWT │
+                      │  2. Acquire APIM MI JWT │
+                      │  3. Forward both to API │
+                      └───────────┬────────────┘
+                                  │
+                         Two JWTs sent downstream:
+                         • Authorization: Bearer {Client JWT}
+                         • X-Gateway-Auth: Bearer {APIM MI JWT}
+                                  │
+                                  ▼
+                      ┌────────────────────────┐
+                      │   API Service (AKS)    │
+                      │                        │
+                      │  1. Verify APIM MI JWT │
+                      │     (trusted gateway?) │
+                      │  2. Verify Client JWT  │
+                      │     (who is calling?)  │
+                      │  3. Authorize request  │
+                      └────────────────────────┘
+```
+
+**Why dual auth?**
+- The API pod **never** accepts traffic that didn't come through APIM (verifies gateway identity)
+- The API pod **always** knows the original caller identity (re-validates client JWT for defense in depth)
+- If APIM is compromised or bypassed, the backend rejects requests missing a valid APIM MI token
+- Full audit trail: every request is logged with both gateway OID and caller OID
+
+---
+
+## Client Types & Token Acquisition
+
+### Users (Tenant Admins / Operators)
+
+Users authenticate with their **normal Azure AD organizational accounts** (e.g. `admin@contoso.com`). No app registrations or service principals are needed for human users. The platform registers an Enterprise Application in Azure AD that users consent to, which allows Azure AD to issue tokens with the correct audience.
+
+- **Interactive login**: Users sign in via standard browser-based Azure AD login (authorization code flow with PKCE). Tokens are obtained through `az login`, a CLI tool, or any OAuth2-capable client.
+- **Audience**: The platform's registered application ID — same audience used by workers so APIM validates both with one policy.
+- **App Roles**: Defined on the App Registration manifest. Assigned to users (or groups) via the Enterprise Application in Azure AD. Appear in the JWT `roles` claim.
+
+**App Roles defined on the App Registration**:
+
+| App Role Value | Display Name | Who Gets It | Effect |
+|----------------|--------------|-------------|--------|
+| `Platform.Admin` | Platform Administrator | Global admins | Bypasses per-tenant checks — full access to all tenants |
+| `Platform.User` | Platform User | All regular users | Grants API access; per-tenant permissions come from `tenant_members` table |
+
+> A user **must** have at least one App Role to call the API at all. Users without a role in their JWT are rejected at APIM. Per-tenant granularity (owner / admin / operator / viewer) is controlled in the database via the `tenant_members` table — not via Azure AD.
+
+**Key JWT claims for users**:
+- `oid` — Azure AD object ID of the user
+- `preferred_username` — user's email / UPN (e.g. `admin@contoso.com`)
+- `roles` — platform-wide App Roles (`Platform.Admin` or `Platform.User`)
+- `tid` — Azure AD tenant ID (used to cross-reference platform tenant's `azure_ad_tenant_id`)
+- No `appid` claim — this is a user token, not a service principal
+
+### Workers (Container App Agents)
+
+Workers authenticate via **Managed Identity** (system-assigned or user-assigned on the Container App). The MI obtains a token from Azure AD using the client_credentials grant — no secrets, passwords, or certificates are stored or managed by the worker.
+
+- **Token acquisition**: The Container App runtime automatically fetches a token from the Azure Instance Metadata Service (IMDS) when the worker requests one for the platform's audience.
+- **Audience**: Same platform application ID as users.
+
+**Key JWT claims for workers**:
+- `oid` — MI object ID (unique worker identifier)
+- `appid` — MI application ID
+- `tid` — Azure AD tenant (used to cross-reference platform tenant)
+- No `roles` claim — worker authorization is based on registration status in the database, not Azure AD roles
+
+> **How APIM tells them apart**: Both client types target the **same audience**. APIM (and the backend) differentiate callers by checking for the `roles` claim. If `roles` is present (contains `Platform.Admin` or `Platform.User`) → user. If `roles` is absent and `X-Tenant-ID` header is provided → worker.
+
+---
+
+## APIM Inbound Policy Chain
+
+All policies execute in the APIM **inbound** pipeline, in order. These are described as design behaviors — implementation uses standard APIM policy elements.
+
+### Step 1: Validate Client JWT (Users & Workers)
+
+APIM validates the `Authorization: Bearer` header on every request:
+
+- Fetches signing keys automatically from Azure AD's OpenID Connect metadata endpoint (JWKS)
+- Verifies JWT **signature** (cryptographic proof it was issued by Azure AD)
+- Verifies **issuer** matches the expected Azure AD tenant
+- Verifies **audience** matches the platform's registered application ID
+- Verifies **expiry** (rejects expired tokens)
+- Extracts `oid`, `tid`, and `roles` claims into APIM context variables for use in later policies
+
+Both user and worker tokens are validated by the same policy — they share the same audience. No manual key management is needed; APIM handles JWKS rotation automatically.
+
+### Step 2: Detect Caller Type & Extract Context
+
+After JWT validation, APIM determines the caller type:
+
+- **If `roles` claim exists** → caller is a **user**. Tenant ID is derived from the JWT `tid` claim.
+- **If `roles` claim is absent** → caller is a **worker**. Tenant ID is read from the required `X-Tenant-ID` request header.
+
+If a worker request is missing the `X-Tenant-ID` header, APIM returns `400 Bad Request` immediately.
+
+### Step 3: Rate Limiting
+
+APIM applies rate limits to protect the backend:
+
+- **Per-tenant limit**: 100 requests/minute, keyed by resolved tenant ID. Prevents any single tenant from overwhelming the platform.
+- **Per-caller registration limit**: 10 requests/minute on the `/workers/register` endpoint, keyed by caller OID. Prevents registration abuse.
+
+### Step 4: APIM Acquires Its Own MI Token (Gateway Identity)
+
+This is the key piece of the dual-auth model. APIM uses its own **system-assigned Managed Identity** to acquire a JWT token from Azure AD, targeting the platform's application audience. This token proves to the backend that the request came through the trusted APIM gateway.
+
+APIM injects the following headers before forwarding:
+
+| Header | Value | Source |
+|--------|-------|--------|
+| `Authorization` | `Bearer {client JWT}` | Unchanged — original caller token passed through |
+| `X-Gateway-Auth` | `Bearer {APIM MI JWT}` | Freshly acquired by APIM using its own MI |
+| `X-Caller-OID` | Caller's `oid` claim | Extracted from validated client JWT |
+| `X-Caller-Type` | `user` or `worker` | Determined in step 2 |
+| `X-Tenant-ID` | Platform tenant UUID | From JWT `tid` (user) or request header (worker) |
+
+### Step 5: Forward to Backend
+
+APIM routes the enriched request to the backend API service over the private network path.
+
+---
+
+## APIM → Backend: Network Path
+
+```
+APIM (Public Endpoint, VNET-integrated)
     ↓
-1. Calls: GET https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token
-   Headers: 
-     - client_id: {worker_managed_identity_client_id}
-   Body:
-     - grant_type: client_credentials
-     - scope: https://{apim-resource-id}/.default
-     - client_assertion: (signed by worker's MI key)
+    │  HTTPS (VNET-injected private traffic)
     ↓
-2. Azure AD returns JWT:
-   {
-     "access_token": "eyJ0eXAiOiJKV1QiLCJhbGc...",
-     "expires_in": 3600,
-     "token_type": "Bearer"
-   }
+Azure Internal Load Balancer (private IP in AKS VNET)
     ↓
-3. JWT Payload (decoded):
-   {
-     "iss": "https://login.microsoftonline.com/{tenantId}/v2.0",
-     "aud": "https://{apim-resource-id}",
-     "oid": "{worker-mi-object-id}",
-     "sub": "{worker-mi-subject}",
-     "tenant_id": "{azure-tenant-id}",
-     "appid": "{application-id}",
-     "exp": 1716384123  (3600 seconds from now)
-   }
-```
-
-### Step 2: Worker Sends Request to APIM with JWT
-```
-Worker Container App
+    │  Routes to AKS node pool
     ↓
-POST https://{apim-endpoint}/api/workers/register
-Headers:
-  - Authorization: Bearer {jwt_token}
-  - Content-Type: application/json
-Body:
-  {
-    "worker_name": "worker-prod-01",
-    "region": "eastus",
-    "tags": {"env": "prod"}
-  }
+Ingress Controller (nginx, terminates TLS from ILB)
+    ↓
+    │  Plain HTTP within cluster
+    │  Cilium encrypts pod-to-pod at kernel level (WireGuard)
+    ↓
+API Service Pod (az-rotator-api namespace, listens on :8080)
 ```
+
+**Key points**:
+- APIM is VNET-integrated — traffic goes directly into the VNET without public hops
+- Internal LB has a private IP only — not internet-reachable
+- Ingress controller terminates TLS from the load balancer
+- Within the cluster, Cilium encrypts all pod traffic transparently (WireGuard)
+- API pod runs plain HTTP on port 8080 — no app-level TLS burden
+- Cilium network policies restrict ingress to the API pod to only the ingress-nginx namespace
 
 ---
 
-## APIM JWT Validation & Policy Chain
+## Backend Dual-Auth Verification (Defense in Depth)
 
-### Policy 1: Validate JWT Signature & Claims
-```xml
-<!-- APIM Inbound Policy -->
-<policies>
-  <inbound>
-    <!-- Step 1: Extract JWT from Authorization header -->
-    <validate-jwt 
-        header-name="Authorization" 
-        failed-validation-httpcode="401" 
-        failed-validation-error-message="Invalid or missing JWT">
-      
-      <!-- Step 2: Define issuer (Azure AD) -->
-      <issuer>https://login.microsoftonline.com/{tenant-id}/v2.0</issuer>
-      
-      <!-- Step 3: Define audience (APIM resource ID) -->
-      <audiences>
-        <audience>https://{apim-resource-id}</audience>
-      </audiences>
-      
-      <!-- Step 4: Define signing keys (from Azure AD metadata) -->
-      <signing-keys>
-        <key>{key-from-azure-ad-jwks-endpoint}</key>
-      </signing-keys>
-      
-      <!-- Step 5: Extract claims into context for later use -->
-      <claim name="oid" />
-      <claim name="sub" />
-      <claim name="appid" />
-    </validate-jwt>
-    
-    <!-- Step 6: Extract tenant claim and validate it exists -->
-    <set-variable name="tenant_id" value="@{context.Request.Headers.GetValueOrDefault("X-Tenant-ID", "")}" />
-    
-    <!-- Step 7: Reject if tenant_id is missing or invalid -->
-    <choose>
-      <when condition="@(string.IsNullOrEmpty((string)context.Variables["tenant_id"]))">
-        <return-response>
-          <set-status code="400" reason="Bad Request" />
-          <set-body>{ "error": "X-Tenant-ID header is required" }</set-body>
-        </return-response>
-      </when>
-    </choose>
-  </inbound>
-</policies>
-```
+The API service validates **both** identities on every request. It never trusts APIM-injected headers alone.
 
-**What This Does**:
-1. ✅ Validates JWT signature (ensures it's signed by Azure AD)
-2. ✅ Validates issuer (ensures it came from Azure AD)
-3. ✅ Validates audience (ensures it's intended for APIM)
-4. ✅ Validates expiry (rejects expired tokens)
-5. ✅ Extracts claims (`oid`, `sub`, `appid`) for downstream use
-6. ✅ Requires tenant context header
+### Headers Arriving at the API Pod
+
+| Header | Purpose |
+|--------|---------|
+| `Authorization: Bearer {Client JWT}` | Original caller token (user or worker) |
+| `X-Gateway-Auth: Bearer {APIM MI JWT}` | APIM's own MI token — proves gateway origin |
+| `X-Caller-OID` | Caller's object ID, extracted by APIM from client JWT |
+| `X-Caller-Type` | `user` or `worker`, determined by APIM |
+| `X-Tenant-ID` | Resolved tenant context |
+
+### Verification Steps
+
+The backend middleware performs these checks in order:
+
+1. **Verify gateway identity** — Parse and validate the `X-Gateway-Auth` JWT against Azure AD. Confirm the `oid` claim matches the known APIM Managed Identity object ID. If this fails, reject with `401 Unauthorized` — the request did not come through the trusted gateway.
+
+2. **Verify client identity** — Parse and validate the `Authorization` JWT against Azure AD. Check signature, issuer, audience, and expiry. This is defense in depth — APIM already validated it, but the backend re-checks independently.
+
+3. **Anti-tampering check** — Compare the `oid` claim from the client JWT against the `X-Caller-OID` header injected by APIM. If they don't match, someone tampered with the headers in transit. Reject with `401 Unauthorized`.
+
+4. **Caller-type authorization**:
+   - **Worker**: Look up the worker by OID and tenant ID in PostgreSQL. Reject if the worker is not in `APPROVED` status (`403 Forbidden`).
+   - **User (Platform.Admin)**: If `roles` contains `Platform.Admin`, authorize immediately — global admins bypass per-tenant checks.
+   - **User (Platform.User)**: Look up `tenant_members` WHERE `user_oid = {oid}` AND `tenant_id = {requested-tenant}`. If no row → `403 Forbidden`. If row exists → check that the member's `role` (owner/admin/operator/viewer) has sufficient permission for the endpoint.
+
+5. **Inject verified context** — Set the verified gateway OID, caller OID, caller type, and tenant ID into the request context for downstream handlers. Log the auth result with both identities for audit.
 
 ---
 
-### Policy 2: Tenant Isolation - Extract & Validate Tenant Claim
-```xml
-<policies>
-  <inbound>
-    <!-- After JWT validation above -->
-    
-    <!-- Extract worker MI's object ID from JWT -->
-    <set-variable name="worker_oid" value="@{(string)context.Request.Headers.GetValueOrDefault("Authorization").Split(' ')[1]}" />
-    
-    <!-- Look up worker in database via API backend to get tenant -->
-    <!-- OR: Worker provides tenant in X-Tenant-ID header + we validate it matches their MI -->
-    
-    <!-- Option A: Simple - trust X-Tenant-ID (less secure, assumes client honesty) -->
-    <set-variable name="tenant_from_header" value="@{context.Request.Headers.GetValueOrDefault("X-Tenant-ID", "")}" />
-    
-    <!-- Option B: Secure - validate worker MI ownership of tenant -->
-    <!-- Call internal API to verify: {worker_oid} ∈ {tenant.approved_workers} -->
-    <send-request mode="new" response-variable-name="worker-validation-response">
-      <set-url>@{new Uri(new Uri("https://api-service:8080"), "/internal/validate-worker").AbsoluteUri}</set-url>
-      <set-method>POST</set-method>
-      <set-header name="Content-Type" value="application/json" />
-      <set-body>@{
-        new JObject(
-          new JProperty("worker_oid", (string)context.Variables["worker_oid"]),
-          new JProperty("tenant_id", context.Request.Headers.GetValueOrDefault("X-Tenant-ID", ""))
-        ).ToString()
-      }</set-body>
-    </send-request>
-    
-    <!-- Check validation response -->
-    <choose>
-      <when condition="@{((IResponse)context.Variables["worker-validation-response"]).StatusCode != 200}">
-        <return-response>
-          <set-status code="403" reason="Forbidden" />
-          <set-body>{ "error": "Worker not approved for this tenant" }</set-body>
-        </return-response>
-      </when>
-    </choose>
-    
-    <!-- If validation passed, inject tenant context for downstream services -->
-    <set-header name="X-Tenant-ID" value="@{context.Request.Headers.GetValueOrDefault("X-Tenant-ID", "")}" />
-    <set-header name="X-Worker-OID" value="@{(string)context.Variables["worker_oid"]}" />
-    
-  </inbound>
-</policies>
-```
+## End-to-End Request Flows
 
-**What This Does**:
-1. ✅ Extracts worker MI's object ID (`oid`) from JWT
-2. ✅ Validates that worker is registered for the requested tenant
-3. ✅ Injects tenant & worker context into headers for API service to consume
-4. ✅ Rejects if worker not authorized for tenant (403 Forbidden)
-
----
-
-### Policy 3: Rate Limiting & Throttling (Optional)
-```xml
-<policies>
-  <inbound>
-    <!-- Rate limit per tenant to prevent single tenant hogging APIM -->
-    <rate-limit-by-key 
-        calls="100" 
-        renewal-period="60" 
-        counter-key="@{context.Request.Headers.GetValueOrDefault("X-Tenant-ID", "unknown")}" 
-        increment-condition="@{context.Response.StatusCode < 400}">
-    </rate-limit-by-key>
-  </inbound>
-</policies>
-```
-
----
-
-## APIM → API Service: Secure Forwarding (mTLS + Cilium)
-
-### Architecture: APIM → Internal LB (mTLS) → AKS Cluster (Cilium mTLS internal)
+### Flow A: User Approves a Worker
 
 ```
-APIM (Azure Managed Service)
-    ↓ mTLS HTTPS (APIM has client cert)
-Azure Internal Load Balancer (in VNET)
-    - Frontend: HTTPS port 443 (server cert)
-    - Backend pool: AKS nodes or service endpoints
-    ↓ Routes to backend
-AKS Cluster (Private Network)
-    ↓ Ingress / Kubernetes Service (terminates LB HTTPS)
-    ↓ Cilium network layer (encrypts all pod traffic)
-API Pod (listens on plain HTTP:8080, Cilium encrypts automatically)
-```
-
-### Step 1: APIM mTLS Configuration to Internal Load Balancer
-
-**APIM Backend** (points to Internal LB):
-```json
-{
-  "type": "Microsoft.ApiManagement/service/backends",
-  "name": "api-service-backend",
-  "properties": {
-    "url": "https://api-internal-lb.{vnet-name}.private:443",
-    "protocol": "https",
-    "tls": {
-      "validateCertificateChain": true,
-      "validateCertificateName": true
-    },
-    "credentials": {
-      "clientCertificate": "{base64-pfx-with-apim-client-cert}"
-    }
-  }
-}
-```
-
-**APIM Policy** (use the backend):
-```xml
-<set-backend-service 
-    base-url="https://api-internal-lb.{vnet-name}.private:443" />
-```
-
-**Why**:
-- ✅ mTLS between APIM (public) and Internal LB ensures encrypted, authenticated entry to private network
-- ✅ APIM client cert validates APIM to LB
-- ✅ Internal LB is in your VNET (private, not internet-exposed)
-
-### Step 2: Internal Load Balancer Configuration
-
-```hcl
-# Terraform
-resource "azurerm_lb" "internal" {
-  name                = "api-internal-lb"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  load_balancer_sku   = "Standard"
-
-  frontend_ip_configuration {
-    name                          = "api-frontend"
-    subnet_id                     = azurerm_subnet.aks_subnet.id
-    private_ip_address_allocation = "Static"
-    private_ip_address            = "10.0.1.10"
-  }
-}
-
-resource "azurerm_lb_backend_address_pool" "api" {
-  loadbalancer_id = azurerm_lb.internal.id
-  name            = "api-backend-pool"
-}
-
-resource "azurerm_lb_probe" "api" {
-  loadbalancer_id = azurerm_lb.internal.id
-  name            = "api-health"
-  port            = 8080
-  protocol        = "http"
-  request_path    = "/health"
-}
-
-resource "azurerm_lb_rule" "api" {
-  loadbalancer_id            = azurerm_lb.internal.id
-  name                       = "api-443"
-  protocol                   = "Tcp"
-  frontend_port              = 443
-  backend_port               = 8080  # Ingress listens on 8080
-  frontend_ip_configuration_name = "api-frontend"
-  backend_address_pool_ids   = [azurerm_lb_backend_address_pool.api.id]
-  probe_id                   = azurerm_lb_probe.api.id
-}
-```
-
-### Step 3: AKS Ingress (Terminates LB HTTPS, Routes to API Pod)
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: api-ingress
-  namespace: az-rotator-api
-spec:
-  ingressClassName: nginx
-  # Ingress terminates HTTPS from LB
-  tls:
-    - hosts:
-        - api-internal-lb.{vnet-name}.private
-      secretName: api-tls-cert  # Server cert for LB
-  rules:
-    - host: api-internal-lb.{vnet-name}.private
-      http:
-        paths:
-          - path: /api
-            pathType: Prefix
-            backend:
-              service:
-                name: api-service
-                port:
-                  number: 8080  # API pod plain HTTP
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: api-service
-  namespace: az-rotator-api
-spec:
-  type: ClusterIP
-  ports:
-    - port: 8080
-      targetPort: 8080
-      protocol: TCP
-  selector:
-    app: api
-```
-
-### Step 4: API Pod (Plain HTTP, Cilium Handles Encryption)
-
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: api-pod
-  namespace: az-rotator-api
-  labels:
-    app: api
-spec:
-  serviceAccountName: api-sa
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 1000
-    fsGroup: 1000
-    seccompProfile:
-      type: RuntimeDefault
-  containers:
-    - name: api
-      image: {registry}/api:latest
-      ports:
-        - name: http
-          containerPort: 8080
-          protocol: TCP
-      env:
-        - name: PORT
-          value: "8080"
-      livenessProbe:
-        httpGet:
-          path: /health
-          port: 8080
-        initialDelaySeconds: 10
-        periodSeconds: 10
-      readinessProbe:
-        httpGet:
-          path: /ready
-          port: 8080
-        initialDelaySeconds: 5
-        periodSeconds: 5
-      securityContext:
-        allowPrivilegeEscalation: false
-        capabilities:
-          drop: ["ALL"]
-        readOnlyRootFilesystem: true
-      resources:
-        requests:
-          memory: "256Mi"
-          cpu: "100m"
-        limits:
-          memory: "512Mi"
-          cpu: "500m"
-```
-
-**API Pod Code** (plain HTTP, no TLS):
-```go
-// main.go
-func main() {
-  server := &http.Server{
-    Addr:    ":8080",  // Plain HTTP
-    Handler: setupRoutes(),
-  }
-  
-  if err := server.ListenAndServe(); err != nil {
-    log.Fatalf("Server error: %v", err)
-  }
-}
-```
-
-### Step 5: Cilium mTLS for Pod-to-Pod Encryption
-
-**Enable Cilium with mTLS** (at AKS cluster creation):
-
-```hcl
-# Terraform
-resource "azurerm_kubernetes_cluster" "aks" {
-  name                = "aks-control-plane"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  
-  # Use Cilium CNI
-  network_profile {
-    network_plugin = "cilium"
-    ebpf_data_plane = "cilium"
-  }
-  
-  # Enable Cilium mTLS for pod encryption
-  azure_policy_enabled = true
-}
-```
-
-**Or via Helm**:
-```bash
-helm repo add cilium https://helm.cilium.io
-helm install cilium cilium/cilium \
-  --namespace kube-system \
-  --set hubble.enabled=true \
-  --set hubble.ui.enabled=true \
-  --set encryption.enabled=true \
-  --set encryption.type=wireguard
-```
-
-**Cilium NetworkPolicy** (enforces mTLS within cluster):
-```yaml
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: api-encryption
-  namespace: az-rotator-api
-spec:
-  description: "Encrypt all API pod traffic with Cilium mTLS"
-  endpointSelector:
-    matchLabels:
-      app: api
-  ingress:
-    - fromEndpoints:
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: ingress-nginx
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-          rules:
-            l7:
-              - rule: "HTTP"
-  egress:
-    - toEndpoints:
-        - matchLabels:
-            app: api
-      toPorts:
-        - ports:
-            - port: "5432"  # PostgreSQL
-              protocol: TCP
-```
-
-**Why Cilium mTLS is better**:
-- ✅ No app-level TLS complexity (API pod = plain HTTP:8080)
-- ✅ Automatic encryption for ALL pod traffic (not just API)
-- ✅ Cilium manages certificates transparently (no key rotation burden)
-- ✅ NetworkPolicy enforces encryption policies at network layer
-- ✅ Works with any protocol (HTTP, gRPC, etc.)
-
----
-
-## Request Flow: Two-Layer Authentication Model
-
-### Layer 1: Client (Worker) → APIM
-```
-Worker (Managed Identity #1)
-  ↓
-1. Get JWT from Azure AD (scope = APIM resource ID)
-  ↓
-2. POST https://{apim-endpoint}/api/workers/register
-   Authorization: Bearer {Worker JWT}
-   X-Tenant-ID: {tenant-uuid}
-```
-
-### Layer 2: APIM → Backend
-```
-APIM validates Worker JWT + rate limits
-  ↓
-APIM uses its Managed Identity (MI #2) to authenticate to backend
-  ↓
-APIM forwards original Worker JWT in request (+tenant context)
-  ↓
-REQUEST TO BACKEND:
-  Authorization: Bearer {Worker JWT}  ← Client identity (unchanged)
-  X-Tenant-ID: {tenant-uuid}         ← Injected by APIM
-  X-Worker-OID: {worker-oid}         ← Injected by APIM
-  X-APIM-Auth: Bearer {APIM MI JWT}  ← Backend verifies APIM is trusted
-```
-
-### Layer 3: Backend (API Pod) Validates Both Identities
-
-**Step 1: Verify APIM is trusted (connection source)**
-```go
-apimJWT := extractJWT(r.Header.Get("X-APIM-Auth"))
-if !isValidJWT(apimJWT, expectedAPIMResourceID) {
-  http.Error(w, "Untrusted gateway", 403)
-  return
-}
-log.Infof("gateway_verified: apim_oid=%s", apimJWT.OID)
-```
-
-**Step 2: Verify Worker identity + check for tampering**
-```go
-workerJWT := extractJWT(r.Header.Get("Authorization"))
-if !isValidJWT(workerJWT) {
-  http.Error(w, "Invalid worker token", 401)
-  return
-}
-
-workerOID := workerJWT.OID
-if workerOID != r.Header.Get("X-Worker-OID") {
-  http.Error(w, "Token mismatch (tampering detected)", 401)
-  return
-}
-```
-
-**Step 3: Verify worker is approved for tenant**
-```go
-tenantID := r.Header.Get("X-Tenant-ID")
-worker, err := db.GetWorker(tenantID, workerOID)
-if err != nil || worker.Status != "APPROVED" {
-  http.Error(w, "Worker not approved", 403)
-  return
-}
-```
-
-**Step 4: Process request using Worker claims**
-```go
-// All actions scoped to: tenant_id + worker_oid
-log.Infof("auth_success: apim_oid=%s, worker_oid=%s, tenant=%s",
-          apimJWT.OID, workerOID, tenantID)
-// Continue with business logic...
-```
-
----
-
-## API Service Authentication & Authorization
-
-### Authentication Middleware (Validates Both Layers)
-The API service **receives validated headers from APIM** and verifies both identities:
-
-#### Check 1: Verify APIM Gateway Authentication
-```go
-// In API service middleware
-func AuthenticationMiddleware(next http.Handler) http.Handler {
-  return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    // ========== IDENTITY #1: APIM (Gateway) ==========
-    apimAuthHeader := r.Header.Get("X-APIM-Auth")
-    if apimAuthHeader == "" {
-      http.Error(w, "Missing gateway authentication", http.StatusUnauthorized)
-      return
-    }
-    
-    apimTokenString := strings.TrimPrefix(apimAuthHeader, "Bearer ")
-    apimClaims := jwt.MapClaims{}
-    apimToken, err := jwt.ParseWithClaims(apimTokenString, apimClaims, func(token *jwt.Token) (interface{}, error) {
-      return getAzureADPublicKey(token)
-    })
-    
-    if err != nil || !apimToken.Valid {
-      log.Warnf("Invalid APIM token: %v", err)
-      http.Error(w, "Invalid gateway token", http.StatusUnauthorized)
-      return
-    }
-    
-    // Verify APIM token is for the right resource (ILB/backend)
-    apimAudience := apimClaims["aud"].(string)
-    if apimAudience != expectedBackendResourceID {
-      http.Error(w, "Invalid token audience", http.StatusUnauthorized)
-      return
-    }
-    
-    apimOID := apimClaims["oid"].(string)
-    log.Infof("gateway_authenticated: apim_oid=%s", apimOID)
-    
-    // ========== IDENTITY #2: Worker (Client) ==========
-    workerAuthHeader := r.Header.Get("Authorization")
-    if workerAuthHeader == "" {
-      http.Error(w, "Missing worker authorization", http.StatusUnauthorized)
-      return
-    }
-    
-    workerTokenString := strings.TrimPrefix(workerAuthHeader, "Bearer ")
-    workerClaims := jwt.MapClaims{}
-    workerToken, err := jwt.ParseWithClaims(workerTokenString, workerClaims, func(token *jwt.Token) (interface{}, error) {
-      return getAzureADPublicKey(token)
-    })
-    
-    if err != nil || !workerToken.Valid {
-      log.Warnf("Invalid worker token: %v", err)
-      http.Error(w, "Invalid worker token", http.StatusUnauthorized)
-      return
-    }
-    
-    workerOID := workerClaims["oid"].(string)
-    log.Infof("worker_authenticated: oid=%s", workerOID)
-    
-    // ========== CONSISTENCY CHECK: Detect Tampering ==========
-    tenantID := r.Header.Get("X-Tenant-ID")
-    headerWorkerOID := r.Header.Get("X-Worker-OID")
-    
-    if tenantID == "" || headerWorkerOID == "" {
-      http.Error(w, "Missing tenant context", http.StatusBadRequest)
-      return
-    }
-    
-    // Verify JWT claims match APIM-injected headers (catch header tampering)
-    if workerOID != headerWorkerOID {
-      log.Warnf("OID mismatch: jwt=%s, header=%s (tampering attempt)", workerOID, headerWorkerOID)
-      http.Error(w, "Token/header mismatch", http.StatusUnauthorized)
-      return
-    }
-    
-    // ========== AUTHORIZATION: Is worker approved for tenant? ==========
-    worker, err := db.GetWorker(tenantID, workerOID)
-    if err != nil {
-      log.Errorf("Worker lookup failed: %v", err)
-      http.Error(w, "Authorization check failed", http.StatusInternalServerError)
-      return
-    }
-    
-    if worker == nil || worker.Status != "APPROVED" {
-      log.Warnf("Worker not approved: tenant=%s, oid=%s, status=%s",
-                tenantID, workerOID, worker.Status)
-      http.Error(w, "Worker not approved for tenant", http.StatusForbidden)
-      return
-    }
-    
-    // ========== SUCCESS: Inject context for handlers ==========
-    log.Infof("auth_success: gateway_oid=%s, worker_oid=%s, tenant_id=%s",
-              apimOID, workerOID, tenantID)
-    
-    r.Header.Set("X-Auth-Status", "verified")
-    r.Header.Set("X-APIM-OID", apimOID)
-    r.Header.Set("X-Worker-OID", workerOID)
-    r.Header.Set("X-Tenant-ID", tenantID)
-    
-    next.ServeHTTP(w, r)
-  })
-}
-```
-
-#### Check 2: Tenant-Scoped Authorization (in handler)
-```go
-func RegisterWorkerHandler(w http.ResponseWriter, r *http.Request) {
-  tenantID := r.Header.Get("X-Tenant-ID")
-  workerOID := r.Header.Get("X-Worker-OID")
-  
-  // Query: Is this worker already registered for this tenant?
-  existingWorker, err := db.GetWorker(tenantID, workerOID)
-  if err != nil && err != ErrNotFound {
-    http.Error(w, "Database error", http.StatusInternalServerError)
-    return
-  }
-  
-  if existingWorker != nil {
-    http.Error(w, "Worker already registered", http.StatusConflict)
-    return
-  }
-  
-  // Create worker record
-  worker := &Worker{
-    TenantID:  tenantID,
-    WorkerOID: workerOID,
-    Status:    "PENDING_APPROVAL",
-    CreatedAt: time.Now(),
-  }
-  
-  err = db.CreateWorker(worker)
-  if err != nil {
-    http.Error(w, "Failed to register worker", http.StatusInternalServerError)
-    return
-  }
-  
-  // Return registration ID
-  w.Header().Set("Content-Type", "application/json")
-  json.NewEncoder(w).Encode(map[string]string{
-    "registration_id": worker.ID,
-    "status": worker.Status,
-  })
-}
-```
-
----
-
-## Decision: Trust Model at API Service
-
-### Option A: Trust APIM (Simplified)
-```
-API validates:
-  ✓ X-Tenant-ID header presence
-  ✓ X-Worker-OID header presence
-API assumes:
-  ✓ APIM already validated JWT
-  ✓ APIM already verified worker belongs to tenant
-```
-
-**Pros**:
-- Simpler code
-- Faster (no JWT re-validation)
-
-**Cons**:
-- No defense if APIM is compromised
-- Less audit trail
-
-### Option B: Defense in Depth (Recommended)
-```
-API validates:
-  ✓ Authorization header contains valid JWT
-  ✓ JWT signature is valid (Azure AD keys)
-  ✓ JWT claims (iss, aud, exp) are valid
-  ✓ Claims match X-Tenant-ID, X-Worker-OID headers (anti-tampering)
-  ✓ Worker is in "APPROVED" status for tenant
-```
-
-**Pros**:
-- More secure (doesn't trust APIM alone)
-- Better audit trail (original JWT retained)
-- Detects header tampering
-
-**Cons**:
-- More complex code
-- Slight performance hit (JWT validation on every request)
-
----
-
-## Recommended Architecture (End-to-End Encryption)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ WORKER (Container App with Managed Identity)                    │
-│  1. Get JWT from Azure AD: GET /token (scope=APIM)             │
-│  2. Call APIM: POST /api/workers/register (JWT in header)      │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │ HTTPS Public Internet
-                      │ Authorization: Bearer {JWT}
-                      │ X-Tenant-ID: {uuid}
+┌──────────────────────────────────────────────────────┐
+│ User (Tenant Admin, normal Azure AD account)         │
+│  Token: Azure AD JWT (roles=["TenantAdmin"])         │
+│                                                      │
+│  POST /api/tenants/{tid}/workers/{wid}/approve       │
+│  Authorization: Bearer {user-jwt}                    │
+└─────────────────────┬────────────────────────────────┘
                       │
-┌─────────────────────▼───────────────────────────────────────────┐
-│ APIM GATEWAY (Public Endpoint)                                  │
-│                                                                  │
-│ Policies (Inbound):                                             │
-│  1. validate-jwt                                                │
-│     - Verify JWT signature (Azure AD keys)                      │
-│     - Verify issuer, audience, expiry                           │
-│     - Extract claims (oid, appid)                               │
-│                                                                  │
-│  2. send-request (internal API call)                            │
-│     - POST /internal/validate-worker                            │
-│     - Verify: worker_oid in tenant.approved_workers             │
-│                                                                  │
-│  3. set-header                                                  │
-│     - Inject X-Tenant-ID, X-Worker-OID                          │
-│     - Keep Authorization header (for audit)                     │
-│                                                                  │
-│  4. rate-limit-by-key                                           │
-│     - Max 100 req/min per tenant                                │
-│                                                                  │
-│ Forward to Backend Service (mTLS)                               │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │ mTLS HTTPS
-                      │ Client Cert: APIM identity
-                      │ Private Network (Internal LB)
-                      │ X-Tenant-ID: {uuid}
-                      │ X-Worker-OID: {oid}
-                      │ Authorization: Bearer {JWT}
+                      ▼
+┌──────────────────────────────────────────────────────┐
+│ APIM Gateway                                         │
+│  1. validate-jwt → valid, roles=["Platform.User"]   │
+│  2. caller_type = "user"                             │
+│  3. tenant_id from JWT tid claim                     │
+│  4. rate-limit (100/min per tenant)                  │
+│  5. authentication-managed-identity → APIM MI JWT    │
+│  6. Forward:                                         │
+│       Authorization: Bearer {user-jwt}               │
+│       X-Gateway-Auth: Bearer {apim-mi-jwt}           │
+│       X-Caller-OID: {user-oid}                       │
+│       X-Caller-Type: user                            │
+│       X-Tenant-ID: {tid}                             │
+└─────────────────────┬────────────────────────────────┘
                       │
-┌─────────────────────▼───────────────────────────────────────────┐
-│ Azure Internal Load Balancer (Private, VNET)                    │
-│  - Terminal Point for mTLS (server cert)
-│  - Routes traffic to AKS backend pool
-│  - Health checks on pod:8080/health
-└─────────────────────┬───────────────────────────────────────────┘
-                      │ HTTPS (from LB frontend → Ingress)
-                      │ Plain text (Ingress backend → Pod)
-                      │ But Cilium encrypts at kernel level
+                      ▼
+┌──────────────────────────────────────────────────────┐
+│ API Service (az-rotator-api)                         │
+│  1. Verify X-Gateway-Auth → APIM MI is trusted      │
+│  2. Verify Authorization → user JWT is valid         │
+│  3. roles=["Platform.User"] → lookup tenant_members  │
+│  4. tenant_members role = admin or owner → allowed   │
+│  5. Approve worker → status = APPROVED               │
+│  6. Create Service Bus subscription for worker       │
+│  7. Audit log: who approved, when, what              │
+└──────────────────────────────────────────────────────┘
+```
+
+### Flow B: Worker Registers
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Worker (Container App, Managed Identity)             │
+│  Token: Azure AD JWT (MI, no roles claim)            │
+│                                                      │
+│  POST /api/workers/register                          │
+│  Authorization: Bearer {worker-jwt}                  │
+│  X-Tenant-ID: {platform-tenant-uuid}                 │
+└─────────────────────┬────────────────────────────────┘
                       │
-┌─────────────────────▼───────────────────────────────────────────┐
-│ AKS CLUSTER (Private Network, Cilium CNI)                       │
-│                                                                  │
-│ ┌─────────────────────────────────────────────────────────────┐ │
-│ │ Ingress (nginx) - Terminates LB HTTPS                       │ │
-│ │  Routes to Service: api-service:8080                        │ │
-│ └─────────────────────────────────────────────────────────────┘ │
-│                     │                                           │
-│ ┌─────────────────▼─────────────────────────────────────────┐ │
-│ │ az-rotator-api Namespace                                  │ │
-│ │    [Cilium mTLS Boundary - Encrypts all pod traffic]      │ │
-│ │                                                           │ │
-│ │  ┌──────────────────────────────────────────────────┐   │ │
-│ │  │ API Service Pod (Workload Identity)              │   │ │
-│ │  │ Listens: http://localhost:8080 (plain HTTP)     │   │ │
-│ │  │                                                  │   │ │
-│ │  │ Middleware: Authentication                       │   │ │
-│ │  │  1. Extract X-Tenant-ID, X-Worker-OID           │   │ │
-│ │  │  2. Re-validate JWT (defense in depth)           │   │ │
-│ │  │  3. Compare JWT claims vs headers (tampering)   │   │ │
-│ │  │  4. Check worker status in DB                    │   │ │
-│ │  │  5. Inject tenant context                        │   │ │
-│ │  │                                                  │   │ │
-│ │  │ Handler: RegisterWorkerHandler                   │   │ │
-│ │  │  1. Create Worker record (status=PENDING)       │   │ │
-│ │  │  2. Return registration_id                       │   │ │
-│ │  │  3. Log audit event                              │   │ │
-│ │  │                                                  │   │ │
-│ │  └──────────────────────────────────────────────────┘   │ │
-│ │             │                                            │ │
-│ │             ├─[Cilium mTLS encrypted]→ PostgreSQL       │ │
-│ │             │                                            │ │
-│ │             └─[Cilium mTLS encrypted]→ Service Bus      │ │
-│ │                                                           │ │
-│ └─────────────────────────────────────────────────────────┘ │
-│                                                               │
-│ [All pod-to-pod traffic encrypted by Cilium at kernel level] │
-└─────────────────────────────────────────────────────────────┘
+                      ▼
+┌──────────────────────────────────────────────────────┐
+│ APIM Gateway                                         │
+│  1. validate-jwt → valid, no roles                   │
+│  2. caller_type = "worker"                           │
+│  3. tenant_id from X-Tenant-ID header                │
+│  4. rate-limit (10/min for registration endpoint)    │
+│  5. authentication-managed-identity → APIM MI JWT    │
+│  6. Forward:                                         │
+│       Authorization: Bearer {worker-jwt}             │
+│       X-Gateway-Auth: Bearer {apim-mi-jwt}           │
+│       X-Caller-OID: {worker-mi-oid}                  │
+│       X-Caller-Type: worker                          │
+│       X-Tenant-ID: {platform-tenant-uuid}            │
+└─────────────────────┬────────────────────────────────┘
+                      │
+                      ▼
+┌──────────────────────────────────────────────────────┐
+│ API Service (az-rotator-api)                         │
+│  1. Verify X-Gateway-Auth → APIM MI is trusted      │
+│  2. Verify Authorization → worker JWT is valid       │
+│  3. No roles → worker path                           │
+│  4. Create worker record (status = PENDING_APPROVAL) │
+│  5. Return registration_id                           │
+│  6. Audit log: registration attempt                  │
+└──────────────────────────────────────────────────────┘
+```
+
+### Flow C: Worker Reports Rotation Status
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Worker (Approved, processing a job)                  │
+│                                                      │
+│  POST /api/rotations/{jobId}/status                  │
+│  Authorization: Bearer {worker-jwt}                  │
+│  X-Tenant-ID: {platform-tenant-uuid}                 │
+│  Body: { "status": "COMPLETED", ... }                │
+└─────────────────────┬────────────────────────────────┘
+                      │
+                      ▼
+┌──────────────────────────────────────────────────────┐
+│ APIM → same policy chain → API Service               │
+│                                                      │
+│  1. Dual auth verified                               │
+│  2. Worker is APPROVED for tenant                    │
+│  3. Job belongs to tenant (cross-check)              │
+│  4. Update job status in PostgreSQL                  │
+│  5. Audit log: rotation result                       │
+└──────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Summary: JWT Validation & Request Flow
+## APIM Route Map
 
-| Stage | Component | What Happens | Security Control |
-|-------|-----------|--------------|------------------|
-| 1 | **Worker MI** | Obtains JWT from Azure AD (client_credentials flow) | ✅ Azure AD issues signed JWT |
-| 2 | **Worker** | Sends JWT to APIM (Authorization header) | ✅ HTTPS + JWT in header |
-| 3 | **APIM** | Validates JWT signature, issuer, audience, expiry | ✅ Cryptographic validation |
-| 4 | **APIM** | Validates worker belongs to tenant (API call) | ✅ Database lookup via internal API |
-| 5 | **APIM** | Injects tenant context headers | ✅ Custom headers added by APIM |
-| 6 | **APIM** | Forwards to API service (private network + mTLS optional) | ✅ Private connectivity |
-| 7 | **API Service** | (Option A) Trusts APIM headers | ⚠️ Simplified trust model |
-| 7 | **API Service** | (Option B) Re-validates JWT + verifies headers | ✅ Defense in depth |
-| 8 | **API Service** | Creates Worker record in DB (status=PENDING_APPROVAL) | ✅ Audit logged |
-| 9 | **API Service** | Returns registration_id to worker | ✅ Ready for admin approval |
+Routes exposed by APIM and which caller types are allowed:
+
+| Method | Path | Caller | Purpose |
+|--------|------|--------|---------|
+| POST | `/api/tenants/register` | user | Create a new tenant |
+| GET | `/api/tenants/{tid}` | user | Get tenant details |
+| POST | `/api/workers/register` | worker | Register a new worker |
+| POST | `/api/tenants/{tid}/workers/{wid}/approve` | user | Approve a pending worker |
+| POST | `/api/tenants/{tid}/jobs` | user | Create a rotation job |
+| POST | `/api/rotations/{jobId}/status` | worker | Report rotation job status |
+| POST | `/api/workers/heartbeat` | worker | Worker heartbeat |
+| GET | `/api/tenants/{tid}/jobs` | user | List jobs for a tenant |
+| GET | `/api/tenants/{tid}/audit` | user | View audit logs |
+| GET | `/api/policies/*` | user | Manage rotation policies |
+| PUT | `/api/policies/*` | user | Update rotation policies |
 
 ---
 
-## Recommendation: **Go with Option B (Defense in Depth)**
-- Re-validate JWT at API service (small performance cost, big security gain)
-- Keep original JWT in Authorization header for audit trail
-- Verify claims match injected headers (anti-tampering)
-- Log all auth events (worker OID, tenant ID, success/failure)
+## Security Summary
+
+| Layer | What | How |
+|-------|------|-----|
+| **Client → APIM** | Caller authenticates to APIM | Azure AD JWT (MI for workers, org account for users) over HTTPS |
+| **APIM (inbound)** | Validate client identity | `validate-jwt` policy — signature, issuer, audience, expiry, claims |
+| **APIM (inbound)** | Detect caller type | Presence of `roles` claim → user; absence → worker |
+| **APIM (inbound)** | Rate limiting | Per-tenant and per-endpoint rate limits |
+| **APIM → Backend** | Gateway authenticates itself | APIM MI acquires its own JWT, injected in `X-Gateway-Auth` |
+| **APIM → Backend** | Network security | VNET-integrated APIM → Internal LB → AKS (private path) |
+| **Backend** | Verify gateway | Re-validate `X-Gateway-Auth` JWT, check OID matches known APIM MI |
+| **Backend** | Verify client | Re-validate `Authorization` JWT (defense in depth) |
+| **Backend** | Anti-tampering | Compare JWT claims to APIM-injected headers |
+| **Backend** | Authorization | Users: `Platform.Admin` → global access, `Platform.User` → per-tenant role from `tenant_members`; Workers: check `APPROVED` status in DB |
+| **In-cluster** | Pod-to-pod encryption | Cilium WireGuard — transparent kernel-level encryption |
+| **Audit** | Traceability | Both gateway OID and caller OID logged on every request |
+
+### What This Guards Against
+
+- **Bypassed gateway**: Backend rejects requests without a valid APIM MI token
+- **Stolen client JWT**: Rate limiting + short expiry + no static secrets
+- **Header tampering**: Backend compares JWT claims against APIM-injected headers
+- **Cross-tenant access**: Tenant ID enforced at APIM layer and re-verified at API layer
+- **Unauthorized worker**: Worker must be in `APPROVED` status; registration alone grants no access
+- **Unauthorized user**: Must have App Role (`Platform.Admin` or `Platform.User`) + per-tenant role for the endpoint
+- **Replay attacks**: JWT expiry + job leasing (covered in ARCHITECTURE.md)

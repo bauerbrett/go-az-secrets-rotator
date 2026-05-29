@@ -13,9 +13,14 @@ Build a **centralized AKS control plane** in a dedicated VNET behind **APIM** (p
   - **Three namespaces** for control plane services: `az-rotator-api`, `az-rotator-scheduler`, `az-rotator-system`
   - Network policies enabled via **Cilium CNI** for micro-segmentation
   
-- **APIM**: **Public endpoint** fronting the AKS service
-  - Handles API versioning, throttling, **JWT validation** (from Managed Identity), tenant routing
-  - Exposes endpoints: `/api/workers/register`, `/api/policies/*`, `/api/rotations/*`, etc.
+- **APIM**: **Public endpoint** fronting the AKS service (dual-auth gateway)
+  - Authenticates **both** client types: users (Azure AD App Reg / interactive) and workers (Managed Identity)
+  - Validates client JWT up front (signature, issuer, audience, expiry, claims)
+  - Detects caller type (user vs worker) based on JWT `roles` claim presence
+  - Acquires its own **Managed Identity JWT** and injects it as `X-Gateway-Auth` so the backend can verify traffic came through the trusted gateway
+  - Rate limiting, tenant context injection, header enrichment
+  - Exposes endpoints: `/api/workers/register`, `/api/policies/*`, `/api/rotations/*`, `/api/tenants/*`, etc.
+  - See [APIM_GATEWAY.md](APIM_GATEWAY.md) for full design
   - **Future**: Can transition to private endpoint + VNet integration when needed
   
 - **Worker Container Apps**: VNET-integrated, customer-owned infrastructure
@@ -23,10 +28,16 @@ Build a **centralized AKS control plane** in a dedicated VNET behind **APIM** (p
   - APIM validates JWT issuer (Azure AD) + audience + tenant scope
   - **Initial**: Public communication via APIM
   - **Future**: Private connectivity via private endpoint or direct VNet routing
+
+- **Users (Tenant Admins / Operators)**: Authenticate with normal Azure AD org accounts
+  - Standard Azure AD interactive login (authorization code flow with PKCE)
+  - JWT includes `roles` claim for platform RBAC via Azure AD App Roles (TenantAdmin, Operator)
+  - Manage tenants, approve workers, create jobs, view audit logs
   
 ### 2. Data & Persistence
 - **PostgreSQL (Azure Database for PostgreSQL)** — single instance MVP
-  - Tables: Tenants, Workers, Rotation Jobs, Policies, Audit Logs
+  - Tables: Tenants, Tenant Members, Workers, Rotation Jobs, Policies, Audit Logs
+  - A **platform tenant** = logical team/project/environment (not an Azure AD tenant). Multiple platform tenants can exist within one Azure AD org.
   - Accessed via **private endpoint** in AKS subnet for security
   
 - **Alternative: Azure Cosmos DB** (if multi-region replication needed later)
@@ -46,11 +57,13 @@ Build a **centralized AKS control plane** in a dedicated VNET behind **APIM** (p
   - Workers access their tenant secrets via Managed Identity RBAC (least privilege)
   - Control plane uses Managed Identity (AKS pod identity) for Azure service auth
   
-- **JWT Authentication (Managed Identity)**:
-  - Worker Container App has Managed Identity assigned
-  - Worker calls `https://login.microsoftonline.com/token` to get JWT token
-  - Token includes `oid` (object ID), `aud` (audience = APIM), tenant claim
-  - APIM validates issuer (Azure AD), audience, and tenant scope in policy
+- **JWT Authentication (Dual-Auth at APIM)**:
+  - **Workers**: Container App has Managed Identity assigned → calls Azure AD for JWT (client_credentials)
+  - **Users**: Authenticate via Azure AD App Registration → get JWT with `roles` claim
+  - Both token types target the same audience (platform App Registration)
+  - APIM validates caller JWT (issuer, audience, expiry, claims) up front
+  - APIM acquires its own MI token and injects as `X-Gateway-Auth` header
+  - Backend verifies **both** the APIM MI token (trusted gateway) and the client JWT (caller identity) — defense in depth
   
 ### 5. Monitoring & Observability
 - **Azure Log Analytics**: Central logging for control plane pod logs, Service Bus metrics
@@ -86,7 +99,7 @@ Three independent Go services deployed in AKS, each with dedicated namespace and
 - **Scheduler ↔ Database**: Direct DB read (no API calls initially)
 - **Scheduler ↔ Service Bus**: Managed Identity RBAC
 - **API ↔ Service Bus**: Managed Identity RBAC  
-- **External (APIM) → API**: Public, JWT validated (Managed Identity issuer)
+- **External (APIM) → API**: Dual-auth — APIM validates client JWT + injects its own MI token; API re-validates both
 
 ---
 
