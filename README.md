@@ -1,290 +1,30 @@
 # go-az-secrets-rotator
-This is going to be a Go app that has a control plane and workers to rotate secrets in Azure. The goal is to be able to set up different scoped workers and onboard the onto the control plane, the workers can live in different VNETS and have their creds scoped individually to what they need to rotate. This allows us to centrally track and log rotations through the control plane but not have the overly permissive SP that needs access to every environment.
 
-Users/teams should be able to onboard a worker and register it with the control plane and then start onboarding all their secrets that need rotating.
+A distributed secret rotation platform built in Go. A centralized control plane (AKS) orchestrates rotation jobs while tenant-owned worker agents (Container Apps) perform the actual secret rotations in their own environments.
 
-# Distributed Secret Rotation Platform
+## How It Works
 
-## Overview
+Teams deploy lightweight **worker agents** in their own VNETs with scoped Managed Identities. Each worker only has access to the secrets it needs to rotate — no single over-permissioned service principal. Teams create **platform tenants** (a logical grouping per team, project, or environment) and register workers against them.
 
-A centralized Kubernetes-hosted control plane orchestrates secret rotation jobs for tenant-owned worker agents.
+Workers register with the **control plane** through an APIM gateway. APIM authenticates every request (users and workers) via Azure AD JWT validation, then authenticates itself to the backend API using its own Managed Identity — a dual-auth model where the API pod always verifies both the gateway identity and the original caller.
 
-Workers:
-- register with the platform
-- subscribe to tenant-scoped queues
-- rotate secrets locally
-- report status and audit results
+Once a worker is approved by an admin, the control plane publishes rotation jobs to tenant-scoped **Azure Service Bus** topics. Workers subscribe to their own queue, lease a job, rotate the secret locally, validate it, and report status back.
 
-The platform never directly accesses tenant secrets.
+The control plane **never** directly accesses tenant secrets. It orchestrates, schedules, enforces policies, and maintains a full audit trail. All state lives in **PostgreSQL**. All cluster traffic is encrypted by **Cilium** at the kernel level.
 
----
+## Key Properties
 
-# High-Level Architecture
+- **No static credentials** — Managed Identity and Workload Identity everywhere
+- **Tenant isolation** — scoped workers, per-tenant queues, row-level data separation
+- **Defense in depth** — dual-auth at the gateway, JWT re-validation at the API, Cilium network policies
+- **Pluggable rotation** — Key Vault, App Registrations, PostgreSQL, MySQL, GitHub PATs, Databricks, Storage Accounts, K8s Secrets
+- **Observable** — OpenTelemetry, Prometheus, Grafana, Log Analytics, App Insights
 
-```text
-                    +----------------------------------+
-                    | Kubernetes Control Plane         |
-                    |----------------------------------|
-                    | API Gateway                      |
-                    | Scheduler                        |
-                    | Worker Registry                  |
-                    | Policy Engine                    |
-                    | Audit Service                    |
-                    | Rotation Coordinator             |
-                    +----------------+-----------------+
-                                     |
-                                     v
-                        +-------------------------+
-                        | PostgreSQL              |
-                        |-------------------------|
-                        | Tenants                 |
-                        | Rotation Policies       |
-                        | Job Metadata            |
-                        | Audit Logs              |
-                        | Worker Registry         |
-                        +-------------------------+
+## Documentation
 
-                                     |
-                                     v
+Detailed design docs live in [`docs/`](docs/):
 
-                        +-------------------------+
-                        | Queue/Event Bus         |
-                        |-------------------------|
-                        | tenant-a-rotations      |
-                        | tenant-b-rotations      |
-                        | tenant-c-rotations      |
-                        +-------------------------+
-
-                     /               |                 \
-                    /                |                  \
-
-         +----------------+  +----------------+  +----------------+
-         | Worker Agent   |  | Worker Agent   |  | Worker Agent   |
-         | Team A         |  | Team B         |  | Team C         |
-         |----------------|  |----------------|  |----------------|
-         | Azure CA       |  | Azure CA       |  | VM/K8s/etc     |
-         | Managed ID     |  | Managed ID     |  | Scoped Access  |
-         | Local Rotation |  | Local Rotation |  | Local Rotation |
-         +----------------+  +----------------+  +----------------+
-```
-
----
-
-# Core Components
-
-## Control Plane (Kubernetes)
-
-### Responsibilities
-- tenant management
-- worker registration
-- scheduling rotations
-- queue publishing
-- policy enforcement
-- audit logging
-- retry orchestration
-- metrics
-
-### Suggested Technologies
-- Go
-- Kubernetes
-- Conatiner Apps
-- Helm
-- gRPC
-- OpenTelemetry
-- Prometheus
-- Grafana
-
----
-
-## PostgreSQL
-
-### Stores
-- tenants
-- worker registrations
-- job metadata
-- rotation history
-- policies
-- audit events
-- leases
-
-### Example Tables
-
-```sql
-tenants
-workers
-rotation_jobs
-rotation_policies
-audit_logs
-job_leases
-worker_heartbeats
-```
-
----
-
-## Queue/Event Bus
-
-- NATS
-OR
-- Azure Service Bus
-
-### Queue Model
-
-```text
-tenant-a-rotation-jobs
-tenant-b-rotation-jobs
-tenant-c-rotation-jobs
-```
-
-Workers only subscribe to their queue.
-
----
-
-## Worker Agent
-
-### Deployment
-Tenant deploys:
-- Azure Container App
-- Kubernetes Deployment
-- VM Container
-
-### Startup Flow
-1. Authenticate using Managed Identity or OIDC
-2. Register with control plane
-3. Obtain queue assignment
-4. Begin polling/subscribing
-
-### Runtime Flow
-1. Receive rotation job
-2. Lease job
-3. Authenticate locally
-4. Rotate secret
-5. Validate secret
-6. Store in tenant Key Vault
-7. Report status
-
----
-
-# Security Design
-
-## Key Trust Boundary
-
-The worker:
-- has privileged access
-
-The control plane:
-- does NOT
-
-The control plane orchestrates but never directly rotates secrets.
-
----
-
-## Authentication
-- Azure Managed Identity
-- OIDC Federation
-- JWT validation
-
-No static credentials.
-
----
-
-## Signed Job Payloads
-
-Protect against:
-- queue tampering
-- spoofing
-- replay attacks
-
----
-
-## Job Leasing
-
-Example:
-
-```text
-job_id: 123
-leased_to: worker-a
-lease_expiry: 12:05 UTC
-```
-
-If a worker crashes:
-- lease expires
-- another worker retries
-
----
-
-## RBAC
-
-Tenants can:
-- manage policies
-- onboard workers
-- view jobs
-- manage approvals
-
----
-
-# Rotation Plugins
-
-### Example Plugins
-- Azure Key Vault
-- Azure App Registrations
-- PostgreSQL
-- MySQL
-- GitHub PAT
-- Kubernetes Secrets
-- Databricks PATs
-- Storage Account Keys
-
----
-
-# Reliability Features
-
-## Retry State Machine
-
-```text
-PENDING
-RUNNING
-VALIDATING
-COMPLETED
-FAILED
-RETRYING
-DEAD_LETTERED
-```
-
----
-
-## Worker Heartbeats
-
-```text
-worker_id
-last_seen
-status
-version
-capabilities
-```
-
----
-
-# Observability
-
-## Metrics
-- rotation latency
-- failure rates
-- retries
-- queue lag
-- worker health
-
----
-
-# Threat Modeling
-
-Document:
-- compromised worker
-- queue poisoning
-- token theft
-- replay attacks
-- malicious tenant
-- privilege escalation
-- stale leases
-
----
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — full architecture, service layout, infra phases
+- [APIM_GATEWAY.md](docs/APIM_GATEWAY.md) — APIM dual-auth design, policy chain, backend middleware
+- [TODO.md](docs/TODO.md) — documentation progress tracker
 
